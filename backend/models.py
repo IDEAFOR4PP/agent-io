@@ -13,6 +13,7 @@ class Product(Base):
     description = Column(String)
     price = Column(Float, nullable=False)
     stock = Column(Integer, default=0)
+    availability_status = Column(String, nullable=False, default='UNCONFIRMED')
 
 class Customer(Base):
     __tablename__ = 'customers'
