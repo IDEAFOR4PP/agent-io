@@ -1,0 +1,7 @@
+# Este archivo le indica a la Interfaz de Línea de Comandos (CLI) del ADK
+# dónde encontrar el punto de entrada principal de tu sistema de agentes.
+
+[tool.adk]
+# La ruta sigue el formato:
+# <nombre_del_paquete>.<nombre_del_archivo>:<nombre_del_objeto_agente>
+agent_path = "publication_ingestion_workflow.agent:PublicationIngestionWorkflow"
