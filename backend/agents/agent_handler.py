@@ -59,7 +59,7 @@ async def process_customer_message(
     # --- 3. Instanciar el Agente para esta Petición ---
     request_agent = Agent(
         name=f"agent_for_{business.id}",
-        model="gemini-1.5-flash",
+        model="gemini-2.5-flash-lite",
         instruction=dynamic_instruction,
         tools=[buscar_producto_wrapper], # Le pasamos el wrapper, no la implementación
     )
