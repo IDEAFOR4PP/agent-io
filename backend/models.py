@@ -14,6 +14,8 @@ class Product(Base):
     price = Column(Float, nullable=False)
     stock = Column(Integer, default=0)
     availability_status = Column(String, nullable=False, default='UNCONFIRMED')
+    business_id = Column(Integer, ForeignKey('businesses.id'), nullable=False)
+    business = relationship("Business", back_populates="products")
 
 class Customer(Base):
     __tablename__ = 'customers'
@@ -40,3 +42,15 @@ class OrderItem(Base):
     price_at_purchase = Column(Float, nullable=False)
     order = relationship("Order")
     product = relationship("Product")
+
+class Business(Base):
+    __tablename__ = 'businesses'
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False) # Ej: "Ferretería Don Pepe"
+    whatsapp_number = Column(String, unique=True, nullable=False) # El número que recibe los mensajes
+    business_type = Column(String, nullable=False) # Ej: 'ferreteria', 'restaurante', 'abarrotes'
+    
+    # ¡Campo clave para la personalización del prompt!
+    personality_description = Column(String) # Ej: "Un tono amigable y servicial, experto en herramientas."
+    
+    products = relationship("Product", back_populates="business")
