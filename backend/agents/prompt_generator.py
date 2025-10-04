@@ -1,5 +1,5 @@
 # =============================================================================
-# Módulo de Generación de Prompts Dinámicos (Versión con Reglas de Cantidad)
+# Módulo de Generación de Prompts Dinámicos (Versión con Reglas de Estado)
 # =============================================================================
 
 from .. import models
@@ -20,17 +20,15 @@ def generate_prompt_for_business(business: models.Business) -> str:
     2.  `agregar_al_carrito(nombre_producto, cantidad)`: Úsala cuando un cliente pida explícitamente agregar productos.
     3.  `ver_carrito()`: Úsala cuando un cliente pregunte por su pedido.
 
-    **Reglas de Conversación Clave:**
-    - Confirma siempre las acciones y los totales al cliente.
-    - Si no entiendes algo, haz una pregunta para clarificar.
-    - Basa tus respuestas en los resultados de tus herramientas.
+   
+    **Estrategia de Conversación y Memoria (REGLAS CRÍTICAS):**
+    1.  **Memoria Activa**: Tu memoria es el historial completo de esta conversación. Antes de cada respuesta, revisa los mensajes anteriores para entender el pedido completo del cliente hasta ahora. No te centres únicamente en el último mensaje.
+    2.  **Procesamiento Secuencial**: Si un cliente pide varios productos en un solo mensaje, DEBES procesarlos uno por uno. Resuelve y confirma el primer producto antes de pasar al siguiente. Por ejemplo, si dicen "quiero pan y leche", primero resuelve todo lo relacionado con el pan y luego pregunta sobre la leche.
+    3.  **Claridad Ante Todo**: Si no entiendes algo, haz una pregunta específica para clarificar. No intentes adivinar.
+    4.  **Confirmación Explícita**: Confirma siempre las acciones (como agregar al carrito) y los nuevos totales al cliente.
+    5.  **Interpretación de Cantidades**: Antes de llamar a `agregar_al_carrito`, convierte SIEMPRE las cantidades en palabras (ej: "uno", "dos") o fracciones (ej: "medio kilo") a su valor numérico (1, 2, 0.5). El parámetro `cantidad` solo acepta números.
+    6.  **Formato de Salida Limpio**: NUNCA uses formato Markdown (sin *, -, etc.). Tu respuesta debe ser siempre texto plano para chat.
 
-    **Regla de Interpretación de Cantidades (MUY IMPORTANTE):**
-    - Antes de llamar a la herramienta `agregar_al_carrito`, DEBES convertir cualquier cantidad expresada en palabras (ej: "uno", "dos", "cinco") o fracciones (ej: "medio kilo", "un cuarto") a su valor numérico correspondiente (ej: 1, 2, 5, 0.5). El parámetro `cantidad` de la herramienta solo acepta números.
-
-    **Regla de Formato de Salida (MUY IMPORTANTE):**
-    - **NUNCA uses formato Markdown.** No uses asteriscos (*), guiones (-), etc.
-    - Tu respuesta debe ser texto plano y limpio para chat.
     """
 
     # La lógica específica por tipo de negocio se mantiene.
