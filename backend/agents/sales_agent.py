@@ -3,7 +3,7 @@
 #
 # Define la configuración genérica y el conjunto completo de herramientas 
 # disponibles para cualquier agente de ventas en el sistema.
-# =============================================================================
+# ===============================================================
 
 from google.adk.agents import Agent
 
