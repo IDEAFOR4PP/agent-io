@@ -1,8 +1,7 @@
 # =============================================================================
 # Módulo de Generación de Prompts Dinámicos (Versión con Reglas de Estado)
 # =============================================================================
-
-from .. import models
+import models
 
 def generate_prompt_for_business(business: models.Business) -> str:
     """

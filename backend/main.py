@@ -12,7 +12,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import List, AsyncGenerator, Any
 import os 
-from dotenv import load_dotenv
+#from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request, Depends, HTTPException
 from pydantic import BaseModel
@@ -20,10 +20,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Importaciones de nuestro proyecto
-from . import models
-from .database import engine, AsyncSessionLocal, Base as DatabaseBase
-from .agents.agent_handler import process_customer_message
-from .agents.sales_agent import root_agent  # Importamos el agente base para el runner
+import models
+from database import engine, AsyncSessionLocal, Base as DatabaseBase
+from agents.agent_handler import process_customer_message
+from agents.sales_agent import root_agent
 from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 
@@ -33,12 +33,12 @@ logger = logging.getLogger(__name__)
 
 # --- CORRECCIÓN 2: Cargar el .env de forma explícita y robusta ---
 # Construimos la ruta al archivo .env que está en el mismo directorio que main.py
-dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
-if os.path.exists(dotenv_path):
-    load_dotenv(dotenv_path=dotenv_path)
-    logger.info("Archivo .env cargado exitosamente.")
-else:
-    logger.warning("Archivo .env no encontrado. Asegúrate de que exista en la carpeta 'backend'.")
+#dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+#if os.path.exists(dotenv_path):
+#    load_dotenv(dotenv_path=dotenv_path)
+#    logger.info("Archivo .env cargado exitosamente.")
+#else:
+#    logger.warning("Archivo .env no encontrado. Asegúrate de que exista en la carpeta 'backend'.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:

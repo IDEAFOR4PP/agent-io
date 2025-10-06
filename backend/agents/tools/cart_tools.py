@@ -11,9 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 
-from ... import models
-# Importamos la tool de búsqueda para reutilizar su lógica
-from .product_tools import buscar_producto
+import models
+from agents.tools.product_tools import buscar_producto
 
 logger = logging.getLogger(__name__)
 

@@ -5,7 +5,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select  # <--- Importación clave para la nueva sintaxis
 from difflib import get_close_matches
-from ... import models
+import models
 
 async def get_all_product_names(db: AsyncSession, business_id: int) -> list[str]:
     """Obtiene todos los nombres de productos para un negocio específico."""
