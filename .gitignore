@@ -4,6 +4,12 @@ Nunca subir la carpeta del entorno virtual. Contiene paquetes que se reinstalan.
 env/
 venv/
 
+.env
+.env.*
+*.env
+gcloud-key.json 
+*.json 
+
 Archivos de caché y compilados de Python
 pycache/
 *.pyc
