@@ -49,9 +49,29 @@ async def process_customer_message(
     
     async def buscar_producto(nombre_producto: str) -> dict: # <-- RENOMBRADO
         """Busca un producto por nombre en el inventario del negocio actual."""
-        return await buscar_producto_impl(
+        # --- INICIO DE LA MODIFICACIÓN ---
+        # 1. Ejecutamos la búsqueda del producto como antes.
+        search_result = await buscar_producto_impl(
             nombre_producto=nombre_producto, business_id=business.id, db=db
         )
+
+        # 2. Interceptamos el estado 'unconfirmed' para el flujo Human-in-the-Loop.
+        if search_result.get("status") == "unconfirmed":
+            product_details = search_result.get("product_details", {})
+            product_id = product_details.get("id")
+            product_name = product_details.get("name")
+
+            if product_id and product_name:
+                # 3. Simulamos la notificación al dueño del negocio.
+                #    En una implementación real, esto enviaría un WhatsApp, email, etc.
+                logger.info(
+                    f"[HUMAN-IN-THE-LOOP] Notificación para '{business.name}': "
+                    f"El cliente '{customer_phone}' preguntó por el producto '{product_name}' (ID: {product_id}). "
+                    f"Por favor, responde a través del sistema de gestión."
+                )
+        
+        return search_result
+        # --- FIN DE LA MODIFICACIÓN ---
 
     async def agregar_al_carrito(nombre_producto: str, cantidad: float) -> dict: # <-- RENOMBRADO
         """Agrega una cantidad específica de un producto al carrito de compras del cliente."""
