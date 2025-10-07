@@ -10,7 +10,7 @@
 # --- 1. Importaciones ---
 import logging
 from contextlib import asynccontextmanager
-from typing import List, AsyncGenerator, Any
+from typing import List, AsyncGenerator, Any, Literal, Optional
 import os 
 #from dotenv import load_dotenv
 
@@ -100,6 +100,11 @@ class ProductSchema(BaseModel):
     class Config:
         from_attributes = True
 
+class InventoryResponsePayload(BaseModel):
+    product_id: int
+    decision: Literal["SI", "NO"]
+    price: Optional[float] = None
+
 # --- 6. Inyección de Dependencias de la Base de Datos ---
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -147,6 +152,41 @@ async def handle_webhook(payload: WebhookPayload, db: AsyncSession = Depends(get
 
     logger.info(f"Respondiendo al usuario: {response_to_user}")
     return {"status": "processed", "response_to_user": response_to_user}
+
+@app.post("/management/inventory_response")
+async def handle_inventory_response(payload: InventoryResponsePayload, db: AsyncSession = Depends(get_db)):
+    """
+    Endpoint para que el dueño del negocio confirme o rechace un producto
+    previamente marcado como 'unconfirmed'.
+    """
+    logger.info(f"Recibida respuesta de inventario para el producto ID: {payload.product_id}")
+
+    # Buscamos el producto en la base de datos
+    result = await db.execute(
+        select(models.Product).where(models.Product.id == payload.product_id)
+    )
+    product = result.scalars().first()
+
+    if not product:
+        raise HTTPException(status_code=404, detail="Producto no encontrado.")
+
+    if payload.decision == "SI":
+        if not payload.price or payload.price <= 0:
+            raise HTTPException(status_code=400, detail="Se requiere un precio válido para confirmar el producto.")
+        
+        product.availability_status = "CONFIRMED"
+        product.price = payload.price
+        message = f"Producto '{product.name}' (ID: {product.id}) confirmado con precio ${payload.price}."
+        
+    elif payload.decision == "NO":
+        product.availability_status = "REJECTED"
+        message = f"Producto '{product.name}' (ID: {product.id}) ha sido rechazado."
+
+    await db.commit()
+    
+    logger.info(message)
+    return {"status": "success", "message": message}
+
 
 @app.get("/products/{business_id}", response_model=List[ProductSchema])
 async def get_business_products(business_id: int, skip: int = 0, limit: int = 100, db: AsyncSession = Depends(get_db)):
