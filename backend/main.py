@@ -12,9 +12,11 @@ import logging
 from contextlib import asynccontextmanager
 from typing import List, AsyncGenerator, Any, Literal, Optional
 import os 
+import csv # <-- Importar para leer el inventario
+import io 
 #from dotenv import load_dotenv
 
-from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -111,12 +113,102 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         yield session
 
+
+async def process_inventory_file(inventory_file: UploadFile, business_id: int):
+    """
+    Tarea en segundo plano para leer un archivo CSV de inventario y poblar la base de datos.
+    Formato esperado del CSV: sku,name,description,price
+    """
+    logger.info(f"Iniciando procesamiento de inventario para el negocio ID: {business_id}")
+    
+    # Creamos una nueva sesión de base de datos para esta tarea en segundo plano.
+    # ¡CRÍTICO! Nunca reutilices la sesión de la petición original en un background task.
+    async with AsyncSessionLocal() as db:
+        try:
+            content = await inventory_file.read()
+            stream = io.StringIO(content.decode("utf-8"))
+            reader = csv.reader(stream)
+
+            # Omitir la cabecera del CSV
+            next(reader, None)
+
+            products_to_add = []
+            for row in reader:
+                # Asumimos el formato: sku, name, description, price
+                if len(row) >= 4:
+                    sku, name, description, price = row[0], row[1], row[2], row[3]
+                    new_product = models.Product(
+                        sku=sku,
+                        name=name,
+                        description=description,
+                        price=float(price),
+                        business_id=business_id,
+                        availability_status='CONFIRMED' # Asumimos que todo lo subido está confirmado
+                    )
+                    products_to_add.append(new_product)
+
+            db.add_all(products_to_add)
+            await db.commit()
+            logger.info(f"Procesamiento de inventario completado. Se añadieron {len(products_to_add)} productos al negocio ID: {business_id}")
+
+        except Exception as e:
+            logger.error(f"Error procesando el archivo de inventario para el negocio ID {business_id}: {e}", exc_info=True)
+            # En un sistema real, aquí notificaríamos al usuario que la carga de su inventario falló.
+            await db.rollback()
+        finally:
+            await inventory_file.close() 
+
+
 # --- 7. Endpoints de la API ---
 
 @app.get("/")
 async def read_root():
     """Endpoint de salud para verificar que la API está en línea."""
     return {"status": "WHSP-AI API is running"}
+
+
+@app.post("/businesses")
+async def create_business(
+    background_tasks: BackgroundTasks,
+    name: str = Form(...),
+    business_type: str = Form(...),
+    personality_description: str = Form(...),
+    whatsapp_number: str = Form(...),
+    inventory_file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Endpoint para dar de alta un nuevo negocio y su inventario inicial.
+    """
+    # Verificamos si el negocio ya existe por su número de WhatsApp.
+    result = await db.execute(
+        select(models.Business).where(models.Business.whatsapp_number == whatsapp_number)
+    )
+    if result.scalars().first():
+        raise HTTPException(status_code=409, detail="Un negocio con este número de WhatsApp ya existe.")
+
+    # Creamos el nuevo negocio
+    new_business = models.Business(
+        name=name,
+        business_type=business_type,
+        personality_description=personality_description,
+        whatsapp_number=whatsapp_number
+    )
+    db.add(new_business)
+    await db.commit()
+    await db.refresh(new_business) # Para obtener el ID generado por la BD
+
+    # Añadimos la tarea de procesamiento de inventario al segundo plano
+    background_tasks.add_task(process_inventory_file, inventory_file, new_business.id)
+    
+    logger.info(f"Negocio '{name}' creado con ID: {new_business.id}. El procesamiento de inventario se ha iniciado en segundo plano.")
+
+    return {
+        "status": "success",
+        "message": "¡Negocio creado exitosamente! Tu inventario se está procesando y estará disponible en unos momentos.",
+        "business_id": new_business.id
+    }
+
 
 @app.post("/webhook")
 async def handle_webhook(payload: WebhookPayload, db: AsyncSession = Depends(get_db)):
