@@ -38,7 +38,7 @@ async def buscar_producto(nombre_producto: str, business_id: int, db: AsyncSessi
     # 2. Búsqueda Fuzzy (si ILIKE falla): Buena para errores de tipeo.
     if not producto:
         product_names = await get_all_product_names(db, business_id=business_id)
-        matches = get_close_matches(nombre_producto.lower(), product_names, n=1, cutoff=0.6)
+        matches = get_close_matches(nombre_producto.lower(), product_names, n=1, cutoff=0.5)
         if matches:
             matched_name = matches[0]
             stmt_fuzzy = select(models.Product).where(
