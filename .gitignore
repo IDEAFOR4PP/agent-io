@@ -11,6 +11,7 @@ gcloud-key.json
 *.json 
 .env.docker
 *.env.docker
+.env.docker/
 
 Archivos de caché y compilados de Python
 pycache/
