@@ -114,27 +114,23 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
-async def process_inventory_file(inventory_file: UploadFile, business_id: int):
+async def process_inventory_file(inventory_content: str, business_id: int):
     """
-    Tarea en segundo plano para leer un archivo CSV de inventario y poblar la base de datos.
+    Tarea en segundo plano para leer el contenido de un CSV de inventario y poblar la base de datos.
     Formato esperado del CSV: sku,name,description,price
     """
     logger.info(f"Iniciando procesamiento de inventario para el negocio ID: {business_id}")
     
-    # Creamos una nueva sesión de base de datos para esta tarea en segundo plano.
-    # ¡CRÍTICO! Nunca reutilices la sesión de la petición original en un background task.
     async with AsyncSessionLocal() as db:
         try:
-            content = await inventory_file.read()
-            stream = io.StringIO(content.decode("utf-8"))
+            # Usamos el contenido de texto directamente.
+            stream = io.StringIO(inventory_content)
             reader = csv.reader(stream)
 
-            # Omitir la cabecera del CSV
-            next(reader, None)
+            next(reader, None) # Omitir cabecera
 
             products_to_add = []
             for row in reader:
-                # Asumimos el formato: sku, name, description, price
                 if len(row) >= 4:
                     sku, name, description, price = row[0], row[1], row[2], row[3]
                     new_product = models.Product(
@@ -143,7 +139,7 @@ async def process_inventory_file(inventory_file: UploadFile, business_id: int):
                         description=description,
                         price=float(price),
                         business_id=business_id,
-                        availability_status='CONFIRMED' # Asumimos que todo lo subido está confirmado
+                        availability_status='CONFIRMED'
                     )
                     products_to_add.append(new_product)
 
@@ -152,11 +148,8 @@ async def process_inventory_file(inventory_file: UploadFile, business_id: int):
             logger.info(f"Procesamiento de inventario completado. Se añadieron {len(products_to_add)} productos al negocio ID: {business_id}")
 
         except Exception as e:
-            logger.error(f"Error procesando el archivo de inventario para el negocio ID {business_id}: {e}", exc_info=True)
-            # En un sistema real, aquí notificaríamos al usuario que la carga de su inventario falló.
+            logger.error(f"Error procesando el contenido del inventario para el negocio ID {business_id}: {e}", exc_info=True)
             await db.rollback()
-        finally:
-            await inventory_file.close() 
 
 
 # --- 7. Endpoints de la API ---
@@ -187,6 +180,16 @@ async def create_business(
     if result.scalars().first():
         raise HTTPException(status_code=409, detail="Un negocio con este número de WhatsApp ya existe.")
 
+    # 2. Leemos el contenido del archivo INMEDIATAMENTE y lo decodificamos.
+    try:
+        content_bytes = await inventory_file.read()
+        inventory_content_str = content_bytes.decode("utf-8")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No se pudo leer el archivo de inventario: {e}")
+    finally:
+        await inventory_file.close()
+
+
     # Creamos el nuevo negocio
     new_business = models.Business(
         name=name,
@@ -196,10 +199,10 @@ async def create_business(
     )
     db.add(new_business)
     await db.commit()
-    await db.refresh(new_business) # Para obtener el ID generado por la BD
+    await db.refresh(new_business)
 
-    # Añadimos la tarea de procesamiento de inventario al segundo plano
-    background_tasks.add_task(process_inventory_file, inventory_file, new_business.id)
+    # 3. Pasamos el CONTENIDO (string), no el objeto de archivo, a la tarea en segundo plano.
+    background_tasks.add_task(process_inventory_file, inventory_content_str, new_business.id)
     
     logger.info(f"Negocio '{name}' creado con ID: {new_business.id}. El procesamiento de inventario se ha iniciado en segundo plano.")
 
