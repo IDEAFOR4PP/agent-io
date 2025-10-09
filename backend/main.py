@@ -16,7 +16,7 @@ import csv # <-- Importar para leer el inventario
 import io 
 #from dotenv import load_dotenv
 
-from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +28,8 @@ from agents.agent_handler import process_customer_message
 from agents.sales_agent import root_agent
 from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from whatsapp_client import send_whatsapp_message
+
 
 # --- 2. Configuración Inicial ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -212,42 +214,83 @@ async def create_business(
         "business_id": new_business.id
     }
 
+# --- INICIO DE LA INTEGRACIÓN CON WHATSAPP ---
 
-@app.post("/webhook")
-async def handle_webhook(payload: WebhookPayload, db: AsyncSession = Depends(get_db)):
+@app.api_route("/webhook", methods=["GET", "POST"])
+async def handle_whatsapp_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     """
-    Endpoint principal para recibir y procesar los mensajes de los clientes.
+    Endpoint unificado para manejar la API de WhatsApp.
+    - GET: Usado por Meta para verificar la URL del webhook.
+    - POST: Usado para recibir notificaciones de mensajes de usuarios.
     """
-    logger.info(f"Webhook recibido para el negocio: {payload.business_phone} de parte de: {payload.customer_phone}")
-    try:
-        # Etapa de Contextualización
-        stmt = select(models.Business).where(models.Business.whatsapp_number == payload.business_phone)
-        result = await db.execute(stmt)
-        business = result.scalars().first()
-        
-        if not business:
-            logger.error(f"Negocio no encontrado para el número: {payload.business_phone}")
-            raise HTTPException(status_code=404, detail="Business not registered")
+    if request.method == "GET":
+        # --- Lógica de Verificación del Webhook de Meta ---
+        VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
+        mode = request.query_params.get("hub.mode")
+        token = request.query_params.get("hub.verify_token")
+        challenge = request.query_params.get("hub.challenge")
 
-        # Etapa de Delegación a la Lógica de IA
-        response_to_user = await process_customer_message(
-            user_message=payload.message,
-            customer_phone=payload.customer_phone,
-            business=business,
-            db=db,
-            runner=app.state.agent_runner,
-            session_service=app.state.session_service
-        )
-    except HTTPException as http_exc:
-        # Re-lanzamos las excepciones HTTP para que FastAPI las maneje correctamente
-        raise http_exc
-    except Exception as e:
-        logger.critical(f"Error inesperado en el endpoint /webhook: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Ocurrió un error interno en el servidor.")
+        if mode == "subscribe" and token == VERIFY_TOKEN:
+            logger.info("Webhook verificado exitosamente por Meta.")
+            # Meta espera que devolvamos el valor de 'challenge' como un entero.
+            return int(challenge)
+        else:
+            logger.error("Falló la verificación del webhook de Meta. Tokens no coinciden.")
+            raise HTTPException(status_code=403, detail="Error de verificación de token.")
 
-    logger.info(f"Respondiendo al usuario: {response_to_user}")
-    return {"status": "processed", "response_to_user": response_to_user}
+    elif request.method == "POST":
+        # --- Lógica de Procesamiento de Mensajes Entrantes ---
+        payload = await request.json()
+        logger.info(f"Payload de WhatsApp recibido: {payload}")
 
+        try:
+            # Extraemos los datos clave del complejo objeto JSON de Meta.
+            change = payload['entry'][0]['changes'][0]
+            if 'messages' not in change['value']:
+                logger.info("Notificación de webhook recibida, pero no es un mensaje (ej. estado de entrega). Ignorando.")
+                return {"status": "ignored_not_a_message"}
+
+            message_object = change['value']['messages'][0]
+            business_phone_id = change['value']['metadata']['phone_number_id'] # ID del número del negocio
+            customer_phone = message_object['from'] # Número del cliente
+            message_text = message_object['text']['body'] # Mensaje del cliente
+
+            # Buscamos el negocio usando el ID del número de teléfono, que es más fiable.
+            stmt = select(models.Business).where(models.Business.whatsapp_number_id == business_phone_id)
+            result = await db.execute(stmt)
+            business = result.scalars().first()
+            
+            if not business:
+                logger.error(f"Negocio no encontrado para el ID de número de teléfono: {business_phone_id}")
+                raise HTTPException(status_code=404, detail="Business not registered for this phone ID")
+
+            # Delegamos la lógica de IA al agent_handler
+            response_to_user = await process_customer_message(
+                user_message=message_text,
+                customer_phone=customer_phone,
+                business=business,
+                db=db,
+                runner=app.state.agent_runner,
+                session_service=app.state.session_service
+            )
+
+            # Enviamos la respuesta del agente de vuelta al usuario vía WhatsApp
+            await send_whatsapp_message(to=customer_phone, message=response_to_user)
+            
+            logger.info(f"Respuesta del agente enviada a {customer_phone} vía WhatsApp.")
+            # Respondemos a la API de Meta con un 200 OK para confirmar la recepción.
+            return {"status": "processed_and_sent"}
+
+        except (KeyError, IndexError, TypeError) as e:
+            logger.warning(f"Payload de webhook recibido no tiene el formato de un mensaje estándar. Error: {e}. Ignorando.")
+            return {"status": "ignored_malformed_payload"}
+        except HTTPException as http_exc:
+            raise http_exc
+        except Exception as e:
+            logger.critical(f"Error inesperado en el webhook de WhatsApp: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Error interno del servidor.")
+
+# --- FIN DE LA INTEGRACIÓN CON WHATSAPP ---
 @app.post("/management/inventory_response")
 async def handle_inventory_response(payload: InventoryResponsePayload, db: AsyncSession = Depends(get_db)):
     """
