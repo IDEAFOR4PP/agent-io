@@ -1,15 +1,19 @@
-# backend/whatsapp_client.py
-
 import httpx
 import os
 import logging
 
 logger = logging.getLogger(__name__)
 
-# --- Carga de Configuración ---
-# Leemos las credenciales desde las variables de entorno.
-WHATSAPP_API_TOKEN = os.getenv("WHATSAPP_API_TOKEN")
-WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+# --- INICIO DE LA MODIFICACIÓN ROBUSTA ---
+# 1. Leemos las variables crudas del entorno.
+raw_api_token = os.getenv("WHATSAPP_API_TOKEN")
+raw_phone_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+
+# 2. Saneamos las variables, eliminando espacios y comillas.
+WHATSAPP_API_TOKEN = raw_api_token.strip().strip('"\'') if raw_api_token else None
+WHATSAPP_PHONE_NUMBER_ID = raw_phone_id.strip().strip('"\'') if raw_phone_id else None
+# --- FIN DE LA MODIFICACIÓN ROBUSTA ---
+
 WHATSAPP_API_URL = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 
 async def send_whatsapp_message(to: str, message: str):
