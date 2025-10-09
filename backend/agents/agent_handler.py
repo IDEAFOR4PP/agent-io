@@ -16,6 +16,8 @@ from agents.tools.product_tools import buscar_producto as buscar_producto_impl
 from agents.tools.cart_tools import (
     agregar_al_carrito as agregar_al_carrito_impl,
     ver_carrito as ver_carrito_impl,
+    remover_del_carrito as remover_del_carrito_impl,      # <-- AÑADIR
+    modificar_cantidad as modificar_cantidad_impl,        # <-- AÑADIR
 )
 
 logger = logging.getLogger(__name__)
@@ -42,9 +44,6 @@ async def process_customer_message(
     Orquesta la lógica de IA, usando wrappers para abstraer
     las dependencias de las tools del LLM.
     """
-    
-    # --- INICIO DE LA CORRECCIÓN ---
-
     # 1. Definir los Wrappers con los nombres correctos que espera el LLM.
     
     async def buscar_producto(nombre_producto: str) -> dict: # <-- RENOMBRADO
@@ -104,8 +103,41 @@ async def process_customer_message(
         ],
     )
     
-    # --- FIN DE LA CORRECCIÓN ---
+    async def remover_del_carrito(nombre_producto: str) -> dict:
+        """Elimina un producto por completo del carrito de compras del cliente."""
+        return await remover_del_carrito_impl(
+            nombre_producto=nombre_producto,
+            business_id=business.id,
+            customer_phone=customer_phone,
+            db=db
+        )
+
+    async def modificar_cantidad(nombre_producto: str, nueva_cantidad: float) -> dict:
+        """Modifica la cantidad de un producto en el carrito. Si la cantidad es 0, lo elimina."""
+        return await modificar_cantidad_impl(
+            nombre_producto=nombre_producto,
+            nueva_cantidad=nueva_cantidad,
+            business_id=business.id,
+            customer_phone=customer_phone,
+            db=db
+        )
+    # --- FIN DE NUEVOS WRAPPERS ---
+
+    dynamic_instruction = generate_prompt_for_business(business)
     
+    request_agent = Agent(
+        name=f"agent_for_{business.id}",
+        model="gemini-2.5-flash-lite",
+        instruction=dynamic_instruction,
+        tools=[
+            buscar_producto,
+            agregar_al_carrito,
+            ver_carrito,
+            remover_del_carrito,   # <-- AÑADIR A LA LISTA
+            modificar_cantidad,    # <-- AÑADIR A LA LISTA
+        ],
+    )
+  
     runner.agent = request_agent
     
     # ... (El resto del archivo no necesita cambios) ...

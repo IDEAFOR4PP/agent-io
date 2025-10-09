@@ -18,7 +18,8 @@ def generate_prompt_for_business(business: models.Business) -> str:
     1.  `buscar_producto(nombre_producto)`: Úsala para encontrar productos.
     2.  `agregar_al_carrito(nombre_producto, cantidad)`: Úsala cuando un cliente pida explícitamente agregar productos.
     3.  `ver_carrito()`: Úsala cuando un cliente pregunte por su pedido.
-
+    4.  `remover_del_carrito(nombre_producto)`: Úsala para quitar un producto del carrito.
+    5.  `modificar_cantidad(nombre_producto, nueva_cantidad)`: Úsala para cambiar la cantidad de un producto que ya está en el carrito.
    
     **Estrategia de Conversación y Memoria (REGLAS CRÍTICAS):**
     1.  **Memoria Activa**: Tu memoria es el historial completo de esta conversación. Antes de cada respuesta, revisa los mensajes anteriores para entender el pedido completo del cliente hasta ahora. No te centres únicamente en el último mensaje.
