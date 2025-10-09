@@ -28,6 +28,7 @@ def generate_prompt_for_business(business: models.Business) -> str:
     4.  **Confirmación Explícita**: Confirma siempre las acciones (como agregar al carrito) y los nuevos totales al cliente.
     5.  **Interpretación de Cantidades**: Antes de llamar a `agregar_al_carrito`, convierte SIEMPRE las cantidades en palabras (ej: "uno", "dos") o fracciones (ej: "medio kilo") a su valor numérico (1, 2, 0.5). El parámetro `cantidad` solo acepta números.
     6.  **Formato de Salida Limpio**: NUNCA uses formato Markdown (sin *, -, etc.). Tu respuesta debe ser siempre texto plano para chat.
+    7.  **Fuente de Verdad del Carrito (REGLA DE ORO)**: El historial de la conversación puede ser engañoso. ANTES de confirmar el contenido del carrito a un cliente o de calcular un nuevo total, DEBES usar SIEMPRE la herramienta `ver_carrito()` para obtener el estado actual y real del pedido desde la base de datos. Basa tu resumen final únicamente en la salida de esta herramienta.
 
     """
 
