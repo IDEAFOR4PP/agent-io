@@ -132,12 +132,13 @@ async def process_inventory_file(inventory_content: str, business_id: int):
             products_to_add = []
             for row in reader:
                 if len(row) >= 4:
-                    sku, name, description, price = row[0], row[1], row[2], row[3]
+                    sku, name, description, price = row[0], row[1], row[2], row[3], row[4]
                     new_product = models.Product(
                         sku=sku,
                         name=name,
                         description=description,
                         price=float(price),
+                        unit=unit,
                         business_id=business_id,
                         availability_status='CONFIRMED'
                     )
