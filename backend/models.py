@@ -27,6 +27,7 @@ class Product(Base):
     price = Column(Float, nullable=False)
     stock = Column(Integer, default=0)
     availability_status = Column(String, nullable=False, default='UNCONFIRMED')
+    unit = Column(String, nullable=False, default='pieza')
     business_id = Column(Integer, ForeignKey('businesses.id'), nullable=False)
     business = relationship("Business", back_populates="products")
 
