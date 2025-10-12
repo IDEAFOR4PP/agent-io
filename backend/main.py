@@ -114,44 +114,73 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
+# Reemplaza esta función completa en backend/main.py
+
 async def process_inventory_file(inventory_content: str, business_id: int):
     """
     Tarea en segundo plano para leer el contenido de un CSV de inventario y poblar la base de datos.
-    Formato esperado del CSV: sku,name,description,price
+    Es robusta ante un número variable de columnas en el CSV.
+    Formato mínimo esperado: name,price
+    Formato completo: sku,name,description,price,unit
     """
     logger.info(f"Iniciando procesamiento de inventario para el negocio ID: {business_id}")
     
     async with AsyncSessionLocal() as db:
         try:
-            # Usamos el contenido de texto directamente.
             stream = io.StringIO(inventory_content)
             reader = csv.reader(stream)
 
-            next(reader, None) # Omitir cabecera
+            # Omitir la cabecera del CSV
+            next(reader, None)
 
             products_to_add = []
-            for row in reader:
-                if len(row) >= 4:
-                    sku, name, description, price = row[0], row[1], row[2], row[3], row[4]
+            for row_number, row in enumerate(reader, 1):
+                # Ignorar filas vacías
+                if not row:
+                    continue
+
+                # --- Lógica de Desempaquetado Seguro ---
+                try:
+                    name = row[1].strip()
+                    price_str = row[3].strip()
+
+                    # Validación mínima: el nombre no puede estar vacío y el precio debe ser un número.
+                    if not name:
+                        logger.warning(f"Fila {row_number} omitida para el negocio {business_id}: El nombre del producto está vacío.")
+                        continue
+                    
+                    price = float(price_str)
+
+                    # Asignación segura con valores por defecto si las columnas no existen
+                    sku = row[0].strip() if len(row) > 0 and row[0] else f"SKU-AUTOGEN-{row_number}"
+                    description = row[2].strip() if len(row) > 2 else None
+                    unit = row[4].strip() if len(row) > 4 and row[4] else 'pieza' # Valor por defecto 'pieza'
+                    
                     new_product = models.Product(
                         sku=sku,
                         name=name,
                         description=description,
-                        price=float(price),
+                        price=price,
                         unit=unit,
                         business_id=business_id,
-                        availability_status='CONFIRMED'
+                        availability_status='CONFIRMED' # Asumimos que si se carga, está confirmado
                     )
                     products_to_add.append(new_product)
 
-            db.add_all(products_to_add)
-            await db.commit()
-            logger.info(f"Procesamiento de inventario completado. Se añadieron {len(products_to_add)} productos al negocio ID: {business_id}")
+                except (IndexError, ValueError) as e:
+                    logger.warning(f"Fila {row_number} omitida para el negocio {business_id} debido a un formato incorrecto: {row}. Error: {e}")
+                    continue # Pasa a la siguiente fila sin detener todo el proceso
+
+            if products_to_add:
+                db.add_all(products_to_add)
+                await db.commit()
+                logger.info(f"Procesamiento de inventario completado. Se añadieron {len(products_to_add)} productos al negocio ID: {business_id}")
+            else:
+                logger.warning(f"No se añadieron productos para el negocio ID: {business_id}. Revisa el archivo de inventario.")
 
         except Exception as e:
-            logger.error(f"Error procesando el contenido del inventario para el negocio ID {business_id}: {e}", exc_info=True)
+            logger.error(f"Error crítico procesando el archivo de inventario para el negocio ID {business_id}: {e}", exc_info=True)
             await db.rollback()
-
 
 # --- 7. Endpoints de la API ---
 
