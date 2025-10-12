@@ -58,7 +58,8 @@ async def buscar_producto(nombre_producto: str, business_id: int, db: AsyncSessi
     base_product_details = {
         "id": producto.id,
         "name": producto.name,
-        "status": producto.availability_status
+        "status": producto.availability_status,
+        "unit": producto.unit
     }
 
     if producto.availability_status == 'CONFIRMED':
