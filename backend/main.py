@@ -190,8 +190,6 @@ async def validate_whatsapp_signature(
     """
     if not WHATSAPP_APP_SECRET:
         logger.error("WHATSAPP_APP_SECRET no está configurado. La validación de firma está deshabilitada.")
-        # En un entorno de producción estricto, deberías lanzar una excepción aquí.
-        # Para flexibilidad, permitimos el paso pero lo registramos.
         return
 
     payload_body = await request.body()
@@ -202,10 +200,11 @@ async def validate_whatsapp_signature(
     ).hexdigest()
 
     if not hmac.compare_digest(f"sha256={expected_signature}", x_hub_signature_256):
-        logger.error("Fallo en la validación de la firma de WhatsApp. La petición podría no ser auténtica.")
+        logger.error("Fallo en la validación de la firma de WhatsApp.")
         raise HTTPException(status_code=403, detail="Firma de la petición inválida.")
     
     logger.info("Firma de WhatsApp validada exitosamente.")
+
 
 # --- 7. Endpoints de la API ---
 
@@ -268,92 +267,87 @@ async def create_business(
     }
 
 # --- INICIO DE LA INTEGRACIÓN CON WHATSAPP ---
-
-@app.api_route("/webhook", methods=["GET", "POST"])
-async def handle_whatsapp_webhook(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-    # La validación de firma solo se aplica a las peticiones POST.
-    _=Depends(validate_whatsapp_signature) if "POST" in request.method else None
-):
+@app.get("/webhook")
+async def verify_webhook(request: Request):
     """
-    Endpoint unificado y seguro para manejar la API de WhatsApp para múltiples negocios.
-    - GET: Usado por Meta para verificar la URL del webhook (lógica global).
-    - POST: Usado para recibir mensajes de usuarios, con firma validada y obtención de token dinámico.
+    Endpoint para que Meta verifique la URL del webhook (GET).
     """
-    if request.method == "GET":
-        # --- Lógica de Verificación del Webhook (Mejorada) ---
-        mode = request.query_params.get("hub.mode")
-        token = request.query_params.get("hub.verify_token")
-        challenge = request.query_params.get("hub.challenge")
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
 
-        if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
-            logger.info("Webhook verificado exitosamente por Meta.")
-            return Response(content=challenge, media_type="text/plain", status_code=200)
-        else:
-            logger.error("Falló la verificación del webhook de Meta. Tokens no coinciden.")
-            raise HTTPException(status_code=403, detail="Error de verificación de token.")
+    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+        logger.info("Webhook verificado exitosamente por Meta.")
+        return Response(content=challenge, media_type="text/plain", status_code=200)
+    else:
+        logger.error("Falló la verificación del webhook de Meta. Tokens no coinciden.")
+        raise HTTPException(status_code=403, detail="Error de verificación de token.")
 
-    elif request.method == "POST":
-        # --- Lógica de Procesamiento de Mensajes Entrantes Multi-Negocio ---
-        payload = await request.json()
-        logger.info(f"Payload de WhatsApp recibido: {payload}")
+@app.post("/webhook", dependencies=[Depends(validate_whatsapp_signature)])
+async def receive_whatsapp_message(request: Request, db: AsyncSession = Depends(get_db)):
+    """
+    Endpoint para recibir mensajes de usuarios (POST), con firma validada y lógica multi-negocio.
+    """
+    payload = await request.json()
+    logger.info(f"Payload de WhatsApp recibido: {payload}")
 
-        try:
-            change = payload['entry'][0]['changes'][0]
-            if 'messages' not in change['value']:
-                logger.info("Notificación de webhook recibida, pero no es un mensaje. Ignorando.")
-                return {"status": "ignored_not_a_message"}
+    try:
+        # 1. Extraer datos clave del payload de Meta
+        change = payload['entry'][0]['changes'][0]
+        if 'messages' not in change['value']:
+            logger.info("Notificación de webhook recibida, pero no es un mensaje (ej. estado de entrega). Ignorando.")
+            return {"status": "ignored_not_a_message"}
 
-            message_object = change['value']['messages'][0]
-            business_phone_id = change['value']['metadata']['phone_number_id']
-            customer_phone = message_object['from']
-            message_text = message_object['text']['body']
+        message_object = change['value']['messages'][0]
+        business_phone_id = change['value']['metadata']['phone_number_id']
+        customer_phone = message_object['from']
+        message_text = message_object['text']['body']
 
-            # Buscamos el negocio usando el ID del número de teléfono, que es nuestra clave única.
-            stmt = select(models.Business).where(models.Business.whatsapp_number_id == business_phone_id)
-            result = await db.execute(stmt)
-            business = result.scalars().first()
-            
-            if not business:
-                logger.error(f"Negocio no encontrado para el ID de número de teléfono: {business_phone_id}")
-                raise HTTPException(status_code=404, detail="Business not registered for this phone ID")
+        # 2. Identificar el negocio contactado usando el 'phone_number_id'
+        stmt = select(models.Business).where(models.Business.whatsapp_number_id == business_phone_id)
+        result = await db.execute(stmt)
+        business = result.scalars().first()
+        
+        if not business:
+            logger.error(f"Negocio no encontrado para el ID de número de teléfono: {business_phone_id}")
+            raise HTTPException(status_code=404, detail="Business not registered for this phone ID")
 
-            # --- LÓGICA DE OBTENCIÓN DE TOKEN SEGURO ---
-            decrypted_api_token = await get_decrypted_api_token(business.whatsapp_number_id)
-            if not decrypted_api_token:
-                logger.critical(f"No se pudo obtener el API Token para el negocio '{business.name}' (ID: {business.id}).")
-                raise HTTPException(status_code=500, detail="Error de configuración de credenciales del negocio.")
-            
-            # Delegamos la lógica de IA al agent_handler
-            response_to_user = await process_customer_message(
-                user_message=message_text,
-                customer_phone=customer_phone,
-                business=business,
-                db=db,
-                runner=request.app.state.agent_runner,
-                session_service=request.app.state.session_service
-            )
+        # 3. Obtener el API Token específico y seguro para este negocio
+        decrypted_api_token = await get_decrypted_api_token(business.whatsapp_number_id)
+        if not decrypted_api_token:
+            logger.critical(f"No se pudo obtener el API Token para el negocio '{business.name}' (ID: {business.id}).")
+            raise HTTPException(status_code=500, detail="Error de configuración de credenciales del negocio.")
+        
+        # 4. Delegar la lógica de IA al 'agent_handler'
+        response_to_user = await process_customer_message(
+            user_message=message_text,
+            customer_phone=customer_phone,
+            business=business,
+            db=db,
+            runner=request.app.state.agent_runner,
+            session_service=request.app.state.session_service
+            # Si has integrado la memoria, añade aquí memory_service=request.app.state.memory_service
+        )
 
-            # Enviamos la respuesta pasando el token específico de este negocio.
-            await send_whatsapp_message(
-                to=customer_phone, 
-                message=response_to_user, 
-                api_token=decrypted_api_token
-            )
-            
-            logger.info(f"Respuesta del agente enviada a {customer_phone} para el negocio '{business.name}'.")
-            return {"status": "processed_and_sent"}
+        # 5. Enviar la respuesta del agente de vuelta al usuario
+        await send_whatsapp_message(
+            to=customer_phone, 
+            message=response_to_user, 
+            api_token=decrypted_api_token
+        )
+        
+        logger.info(f"Respuesta del agente enviada a {customer_phone} para el negocio '{business.name}'.")
+        # 6. Confirmar a Meta que el mensaje fue recibido y procesado
+        return {"status": "processed"}
 
-        except (KeyError, IndexError, TypeError) as e:
-            logger.warning(f"Payload de webhook con formato no esperado. Error: {e}. Ignorando.")
-            return {"status": "ignored_malformed_payload"}
-        except HTTPException as http_exc:
-            raise http_exc
-        except Exception as e:
-            logger.critical(f"Error inesperado en el webhook de WhatsApp: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Error interno del servidor.")
-# --- FIN DE LA INTEGRACIÓN CON WHATSAPP ---
+    except (KeyError, IndexError, TypeError) as e:
+        logger.warning(f"Payload de webhook con formato no esperado. Error: {e}. Ignorando.")
+        return {"status": "ignored_malformed_payload"}
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.critical(f"Error inesperado procesando el mensaje de WhatsApp: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error interno del servidor.")# --- FIN DE LA INTEGRACIÓN CON WHATSAPP ---
 
 @app.post("/management/inventory_response")
 async def handle_inventory_response(payload: InventoryResponsePayload, db: AsyncSession = Depends(get_db)):
