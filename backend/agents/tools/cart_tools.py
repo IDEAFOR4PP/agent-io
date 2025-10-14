@@ -8,7 +8,7 @@
 
 import logging
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
 from sqlalchemy.orm import selectinload
 
 import models
@@ -129,6 +129,117 @@ async def agregar_al_carrito(
         await db.rollback()
         logger.error(f"Error de base de datos al agregar al carrito: {e}", exc_info=True)
         return {"status": "error", "message": "Tuve un problema al intentar agregar el producto a tu pedido."}
+
+async def remover_del_carrito(
+    nombre_producto: str,
+    business_id: int,
+    customer_phone: str,
+    db: AsyncSession,
+) -> dict:
+    """
+    Elimina un producto por completo del carrito de compras del cliente.
+    """
+    logger.info(f"Intentando remover '{nombre_producto}' del carrito.")
+    
+    try:
+        order = await _get_or_create_pending_order_and_customer(business_id, customer_phone, db)
+
+        # Usamos la herramienta 'buscar_producto' para encontrar el ID del producto de forma flexible.
+        product_search = await buscar_producto(nombre_producto, business_id, db)
+        if product_search.get("status") != "success":
+            return {"status": "error", "message": f"No encontré el producto '{nombre_producto}' en tu carrito."}
+
+        product_id = product_search["product_details"]["id"]
+        product_name = product_search["product_details"]["name"]
+
+        # Buscamos el ítem en la orden actual
+        stmt = select(models.OrderItem).where(
+            models.OrderItem.order_id == order.id,
+            models.OrderItem.product_id == product_id
+        )
+        result = await db.execute(stmt)
+        item_to_delete = result.scalars().first()
+
+        if not item_to_delete:
+            return {"status": "error", "message": f"El producto '{product_name}' no se encuentra en tu carrito."}
+
+        # Eliminamos el ítem
+        await db.delete(item_to_delete)
+        await db.flush()
+
+        # Recalculamos el total
+        total_stmt = select(func.sum(models.OrderItem.quantity * models.OrderItem.price_at_purchase)).where(
+            models.OrderItem.order_id == order.id
+        )
+        total_result = await db.execute(total_stmt)
+        new_total = total_result.scalar() or 0.0
+        order.total_price = new_total
+
+        await db.commit()
+        return {"status": "success", "message": f"He eliminado '{product_name}' de tu carrito. El nuevo total es de ${new_total:.2f}."}
+
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error al remover del carrito: {e}", exc_info=True)
+        return {"status": "error", "message": "Tuve un problema al intentar remover el producto de tu pedido."}
+
+
+async def modificar_cantidad(
+    nombre_producto: str,
+    nueva_cantidad: float,
+    business_id: int,
+    customer_phone: str,
+    db: AsyncSession,
+) -> dict:
+    """
+    Modifica la cantidad de un producto existente en el carrito. Si la cantidad es 0, lo elimina.
+    """
+    logger.info(f"Intentando modificar la cantidad de '{nombre_producto}' a {nueva_cantidad}.")
+
+    # Si la nueva cantidad es cero o menos, simplemente removemos el producto.
+    if nueva_cantidad <= 0:
+        return await remover_del_carrito(nombre_producto, business_id, customer_phone, db)
+
+    try:
+        order = await _get_or_create_pending_order_and_customer(business_id, customer_phone, db)
+
+        product_search = await buscar_producto(nombre_producto, business_id, db)
+        if product_search.get("status") != "success":
+            return {"status": "error", "message": f"No encontré el producto '{nombre_producto}' en tu carrito para modificarlo."}
+
+        product_id = product_search["product_details"]["id"]
+        product_name = product_search["product_details"]["name"]
+        
+        stmt = select(models.OrderItem).where(
+            models.OrderItem.order_id == order.id,
+            models.OrderItem.product_id == product_id
+        )
+        result = await db.execute(stmt)
+        item_to_modify = result.scalars().first()
+
+        if not item_to_modify:
+            return {"status": "error", "message": f"El producto '{product_name}' no se encuentra en tu carrito."}
+
+        # Modificamos la cantidad
+        item_to_modify.quantity = nueva_cantidad
+        await db.flush()
+
+        # Recalculamos el total
+        total_stmt = select(func.sum(models.OrderItem.quantity * models.OrderItem.price_at_purchase)).where(
+            models.OrderItem.order_id == order.id
+        )
+        total_result = await db.execute(total_stmt)
+        new_total = total_result.scalar() or 0.0
+        order.total_price = new_total
+        
+        await db.commit()
+        return {"status": "success", "message": f"Actualicé la cantidad de '{product_name}' a {nueva_cantidad}. El nuevo total de tu pedido es de ${new_total:.2f}."}
+
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error al modificar la cantidad: {e}", exc_info=True)
+        return {"status": "error", "message": "Tuve un problema al intentar modificar la cantidad del producto."}
+
 
 async def ver_carrito(
     business_id: int,

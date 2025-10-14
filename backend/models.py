@@ -1,5 +1,5 @@
 from sqlalchemy import (Column, Integer, String, Float, ForeignKey, 
-                        create_engine, DateTime)
+                        create_engine, DateTime, UniqueConstraint)
 from sqlalchemy.orm import relationship, declarative_base
 from sqlalchemy.sql import func
 
@@ -21,14 +21,18 @@ class Customer(Base):
 class Product(Base):
     __tablename__ = 'products'
     id = Column(Integer, primary_key=True)
-    sku = Column(String, unique=True, nullable=False)
+    sku = Column(String, nullable=False)
     name = Column(String, nullable=False)
     description = Column(String)
     price = Column(Float, nullable=False)
     stock = Column(Integer, default=0)
     availability_status = Column(String, nullable=False, default='UNCONFIRMED')
+    unit = Column(String, nullable=False, default='pieza')
     business_id = Column(Integer, ForeignKey('businesses.id'), nullable=False)
     business = relationship("Business", back_populates="products")
+    __table_args__ = (
+        UniqueConstraint('sku', 'business_id', name='_sku_business_uc'),
+    )
 
 class Order(Base):
     __tablename__ = 'orders'
