@@ -16,16 +16,21 @@ WHATSAPP_PHONE_NUMBER_ID = raw_phone_id.strip().strip('"\'') if raw_phone_id els
 
 WHATSAPP_API_URL = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 
-async def send_whatsapp_message(to: str, message: str):
+async def send_whatsapp_message(to: str, message: str, api_token: str): # <-- AÑADE api_token
     """
-    Envía un mensaje de texto a un usuario a través de la API de WhatsApp Business.
+    Envía un mensaje de texto a un número de WhatsApp usando un API Token específico.
     """
-    if not all([WHATSAPP_API_TOKEN, WHATSAPP_PHONE_NUMBER_ID]):
-        logger.error("Faltan variables de entorno de WhatsApp. No se puede enviar el mensaje.")
+    # Lee el Phone Number ID de las variables de entorno (esto puede mejorar después)
+    phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+    
+    # Valida que los datos necesarios están presentes
+    if not api_token or not phone_number_id: # <-- VALIDA EL TOKEN RECIBIDO
+        logger.error("Faltan el API Token o el Phone Number ID para enviar el mensaje.")
         return
 
+    url = f"https://graph.facebook.com/v18.0/{phone_number_id}/messages"
     headers = {
-        "Authorization": f"Bearer {WHATSAPP_API_TOKEN}",
+        "Authorization": f"Bearer {api_token}", # <-- USA EL TOKEN RECIBIDO
         "Content-Type": "application/json",
     }
     # Payload que cumple con la especificación de la API de Meta

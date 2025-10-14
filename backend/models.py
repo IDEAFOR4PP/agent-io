@@ -61,7 +61,7 @@ class Business(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
     whatsapp_number = Column(String, unique=True, nullable=False)
-    whatsapp_number_id = Column(String, unique=True, nullable=True)
+    whatsapp_number_id = Column(String, unique=True, nullable=True) 
     business_type = Column(String, nullable=False)
     personality_description = Column(String)
     products = relationship("Product", back_populates="business")
