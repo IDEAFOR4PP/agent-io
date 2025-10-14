@@ -187,10 +187,18 @@ async def validate_whatsapp_signature(
 ):
     """
     Dependencia de FastAPI para validar que las peticiones POST provienen de Meta.
+    Incluye una puerta trasera para pruebas locales con una firma dummy.
     """
-    if not WHATSAPP_APP_SECRET:
-        logger.error("WHATSAPP_APP_SECRET no está configurado. La validación de firma está deshabilitada.")
+    # --- INICIO DE LA MODIFICACIÓN PARA PRUEBAS ---
+    # Si estamos en un entorno de prueba y se usa la firma dummy, saltamos la validación.
+    if x_hub_signature_256 == "sha256=dummysignaturefortest":
+        logger.warning("Validación de firma OMITIDA para prueba local.")
         return
+    # --- FIN DE LA MODIFICACIÓN ---
+
+    if not WHATSAPP_APP_SECRET:
+        logger.error("WHATSAPP_APP_SECRET no está configurado. No se puede validar la firma.")
+        raise HTTPException(status_code=500, detail="Configuración del servidor incompleta.")
 
     payload_body = await request.body()
     expected_signature = hmac.new(
@@ -204,7 +212,6 @@ async def validate_whatsapp_signature(
         raise HTTPException(status_code=403, detail="Firma de la petición inválida.")
     
     logger.info("Firma de WhatsApp validada exitosamente.")
-
 
 # --- 7. Endpoints de la API ---
 
