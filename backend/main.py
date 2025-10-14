@@ -340,7 +340,8 @@ async def receive_whatsapp_message(request: Request, db: AsyncSession = Depends(
         await send_whatsapp_message(
             to=customer_phone, 
             message=response_to_user, 
-            api_token=decrypted_api_token
+            api_token=decrypted_api_token,
+            phone_number_id=business_phone_id  # <-- PASA EL ID DEL NÚMERO AQUÍ
         )
         
         logger.info(f"Respuesta del agente enviada a {customer_phone} para el negocio '{business.name}'.")
