@@ -16,7 +16,9 @@ import csv # <-- Importar para leer el inventario
 import io 
 #from dotenv import load_dotenv
 
-from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Query
+import hmac
+import hashlib
+from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Query, Header, Response
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +31,8 @@ from agents.sales_agent import root_agent
 from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from whatsapp_client import send_whatsapp_message
+
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
 
 
 # --- 2. Configuración Inicial ---
