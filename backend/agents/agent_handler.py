@@ -1,5 +1,22 @@
 # En backend/agents/agent_handler.py (añadir estas funciones y las importaciones necesarias)
 
+import logging
+from sqlalchemy.ext.asyncio import AsyncSession
+from google.adk.agents import Agent
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
+
+import models
+from agents.prompt_generator import generate_prompt_for_business
+from agents.tools.product_tools import buscar_producto as buscar_producto_impl
+from agents.tools.cart_tools import (
+    agregar_al_carrito as agregar_al_carrito_impl,
+    ver_carrito as ver_carrito_impl,
+    remover_del_carrito as remover_del_carrito_impl,      # <-- AÑADIR
+    modificar_cantidad as modificar_cantidad_impl,        # <-- AÑADIR
+)
+
 import time
 from typing import Optional, Dict, Any
 from copy import deepcopy
@@ -14,6 +31,16 @@ from google.genai import types # Asegúrate de importar types si no lo está
 
 # Instancia del logger (ya deberías tenerla)
 logger = logging.getLogger(__name__)
+
+async def ensure_session(
+    session_service: InMemorySessionService, app_name: str, user_id: str, session_id: str
+):
+    """Asegura que una sesión de conversación exista antes de ser utilizada."""
+    existing = await session_service.list_sessions(app_name=app_name, user_id=user_id)
+    if not any(s.id == session_id for s in existing.sessions):
+        await session_service.create_session(
+            app_name=app_name, user_id=user_id, session_id=session_id
+        )
 
 # --- Funciones de Callback ---
 
