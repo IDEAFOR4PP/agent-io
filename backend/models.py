@@ -68,17 +68,19 @@ class Business(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
     whatsapp_number = Column(String, unique=True, nullable=False)
-    whatsapp_number_id = Column(String, unique=True, nullable=True) 
+    whatsapp_number_id = Column(String, unique=True, nullable=True)
     business_type = Column(String, nullable=False)
     personality_description = Column(String)
-    
-    # --- RELACIONES ACTUALIZADAS ---
+
+    # --- RELACIÓN CON USUARIO (NUEVO) ---
+    # Asume que un negocio es creado/administrado por un usuario.
+    # Es nullable=True para permitir negocios sin usuario asignado inicialmente.
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=True)
+    owner = relationship("User", back_populates="businesses") # Cambiado a 'owner' para claridad
+    # --- FIN RELACIÓN CON USUARIO ---
+
     products = relationship("Product", back_populates="business")
     orders = relationship("Order", back_populates="business")
-    # Relación uno-a-muchos con los usuarios (empleados/dueños)
-    users = relationship("User", back_populates="business")
-    # --- FIN DE ACTUALIZACIÓN ---
-
 # =============================================================================
 # --- INICIO DE NUEVAS TABLAS (USERS, BILLING, PAYMENTS) ---
 # =============================================================================
