@@ -171,12 +171,13 @@ class AgentExecutionLogger:
     def log_tool_start(self, tool: BaseTool, args: Dict[str, Any], tool_context: ToolContext):
         self.start_timing(f'tool_{tool.name}')
         self.update_metric('tool_calls')
-        session_id = tool_context.state.get('session_id', 'unknown_tool_session')
+        session_id_from_state = tool_context.state.get('session_id', 'unknown_tool_session')
+        user_id_from_state = tool_context.state.get('user_id', 'unknown_tool_user')
         self._log('TOOL_START', {
             'agent_name': tool_context.agent_name,
             'invocation_id': tool_context.invocation_id,
-            'session_id': session_id,
-            'user_id': tool_context.user_id,
+            'session_id': session_id_from_state,
+            'user_id': user_id_from_state,
             'tool_name': tool.name,
             'args': args, # Considerar truncar
             'state_keys': list(tool_context.state.to_dict().keys()) if tool_context.state else []
@@ -188,12 +189,13 @@ class AgentExecutionLogger:
         level = 'INFO' if is_success else 'ERROR'
         if not is_success:
             self.update_metric('errors')
-        session_id = tool_context.state.get('session_id', 'unknown_tool_session')
+        session_id_from_state = tool_context.state.get('session_id', 'unknown_tool_session')
+        user_id_from_state = tool_context.state.get('user_id', 'unknown_tool_user')
         self._log('TOOL_END', {
             'agent_name': tool_context.agent_name,
             'invocation_id': tool_context.invocation_id,
-            'session_id': session_id,
-            'user_id': tool_context.user_id,
+            'session_id': session_id_from_state,
+            'user_id': user_id_from_state,
             'tool_name': tool.name,
             'success': is_success,
             'response_status': tool_response.get("status", "unknown") if isinstance(tool_response, dict) else "unknown",
@@ -203,12 +205,13 @@ class AgentExecutionLogger:
 
     def log_cache_hit(self, tool_name: str, args: Dict[str, Any], tool_context: ToolContext):
         self.update_metric('tool_cache_hits') # Incrementar cache hits
-        session_id = tool_context.state.get('session_id', 'unknown_tool_session')
+        session_id_from_state = tool_context.state.get('session_id', 'unknown_tool_session')
+        user_id_from_state = tool_context.state.get('user_id', 'unknown_tool_user')
         self._log('TOOL_CACHE_HIT', {
             'agent_name': tool_context.agent_name,
             'invocation_id': tool_context.invocation_id,
-            'session_id': session_id,
-            'user_id': tool_context.user_id,
+            'session_id': session_id_from_state,
+            'user_id': user_id_from_state,
             'tool_name': tool_name,
             'args': args,
         })
@@ -368,45 +371,32 @@ def before_tool_prod(tool: BaseTool, args: Dict[str, Any], tool_context: ToolCon
     # 2. CACHE MISS: Continuar con logging y validación normal
     execution_logger.log_tool_start(tool, args, tool_context) # Loguear inicio (miss)
 
-    #    ASUMIMOS que estos valores están en tool_context.state (ver process_customer_message)
-    db_session = tool_context.state.get('db_session')
-    business_id_from_state = tool_context.state.get('business_id')
-    # customer_phone_from_state = tool_context.state.get('user_id') # user_id ya está en tool_context
-
-    if not db_session or not business_id_from_state:
-         error_msg = f"Dependencias críticas (db_session o business_id) no encontradas en el estado para {tool.name}"
-         logger.error(error_msg)
-         execution_logger.update_metric('errors') # Contar error
-         return {"status": "error", "message": "Error interno de configuración del agente."}
-
-    # Añadir las dependencias a los 'args' que recibirá la función wrapper
-    args['db'] = db_session
-    args['business_id'] = business_id_from_state
-    # Ya no necesitamos añadir customer_phone si usamos tool_context.user_id en el wrapper
-    # args['customer_phone'] = tool_context.user_id
-
-
     # 3. Validación de argumentos (ejemplo para cantidad)
-    if tool.name == "agregar_al_carrito" or tool.name == "modificar_cantidad":
-        cantidad = args.get('cantidad')
+    if tool.name == "agregar_al_carrito_wrapper" or tool.name == "modificar_cantidad_wrapper":
+        # Usar nombres correctos según la definición del wrapper
+        cantidad = None
+        if tool.name == "agregar_al_carrito_wrapper":
+            cantidad = args.get('cantidad')
+        elif tool.name == "modificar_cantidad_wrapper":
+            cantidad = args.get('nueva_cantidad') # Nombre de parámetro en el wrapper
+
         is_valid_number = isinstance(cantidad, (int, float))
         is_positive = cantidad > 0 if is_valid_number else False
 
-        if tool.name == "agregar_al_carrito" and (not is_valid_number or not is_positive):
-             error_msg = f"Argumento 'cantidad' inválido para {tool.name}: {cantidad}. Debe ser un número positivo."
+        if tool.name == "agregar_al_carrito_wrapper" and (not is_valid_number or not is_positive):
+             error_msg = f"Argumento 'cantidad' inválido: {cantidad}. Debe ser número positivo."
              logger.error(error_msg)
-             # Importante: Retornar error detiene la ejecución y ADK lo envía al LLM
-             return {"status": "error", "message": "La cantidad proporcionada para agregar no es válida."}
-        elif tool.name == "modificar_cantidad":
+             return {"status": "error", "message": "La cantidad para agregar no es válida."}
+        elif tool.name == "modificar_cantidad_wrapper":
              if not is_valid_number:
-                 error_msg = f"Argumento 'nueva_cantidad' inválido para {tool.name}: {cantidad}. Debe ser un número."
+                 error_msg = f"Argumento 'nueva_cantidad' inválido: {cantidad}. Debe ser número."
                  logger.error(error_msg)
-                 return {"status": "error", "message": "La nueva cantidad proporcionada no es válida."}
-             elif cantidad < 0: # Permitir 0, pero no negativo
-                 error_msg = f"Argumento 'nueva_cantidad' negativo inválido para {tool.name}: {cantidad}."
+                 return {"status": "error", "message": "La nueva cantidad no es válida."}
+             elif cantidad < 0:
+                 error_msg = f"Argumento 'nueva_cantidad' negativo: {cantidad}."
                  logger.error(error_msg)
                  return {"status": "error", "message": "La nueva cantidad no puede ser negativa."}
-
+    
     # 4. Permitir ejecución (los 'args' ahora contienen las dependencias inyectadas)
     logger.debug(f"Argumentos inyectados para {tool.name}: {args.keys()}")
     return None
@@ -531,27 +521,99 @@ async def process_customer_message(
     # Esto inyecta las dependencias necesarias sin usar el estado de sesión ADK para objetos no serializables
     # --- INICIO: Definir Funciones Wrapper Dinámicas ---
     async def buscar_producto_wrapper(nombre_producto: str) -> dict:
-        """Busca un producto por nombre en el inventario del negocio actual."""
-        # 'db' y 'business.id' están disponibles aquí por closure
-        return await buscar_producto_impl(nombre_producto=nombre_producto, db=db, business_id=business.id)
+        """
+        Busca un producto y maneja el caso 'unconfirmed' para Human-in-the-Loop.
+        Args:
+            nombre_producto: El nombre o descripción parcial del producto.
+        Returns:
+            Diccionario con el resultado de la búsqueda.
+        """
+        logger.info(f"Wrapper: Iniciando búsqueda para '{nombre_producto}'")
+        # 1. Ejecutar la implementación real
+        search_result = await buscar_producto_impl(
+            nombre_producto=nombre_producto, business_id=business.id, db=db
+        )
+        logger.info(f"Wrapper: Resultado de búsqueda para '{nombre_producto}': {search_result.get('status')}")
+
+        # 2. Interceptar y manejar el estado 'unconfirmed'
+        if search_result.get("status") == "unconfirmed":
+            product_details = search_result.get("product_details", {})
+            product_id = product_details.get("id")
+            product_name_found = product_details.get("name") # Usar nombre diferente para evitar conflicto
+
+            if product_id and product_name_found:
+                # 3. Simular notificación HITL (Human-in-the-Loop)
+                logger.info(
+                    f"[HUMAN-IN-THE-LOOP] Notificación para Negocio ID {business.id} ('{business.name}'): "
+                    f"Cliente '{customer_phone}' preguntó por '{product_name_found}' (ID: {product_id}, Status: UNCONFIRMED). "
+                    f"Se requiere acción en sistema de gestión."
+                )
+                # Aquí podrías añadir lógica para enviar una notificación real (ej. a través de otra función/servicio)
+
+        # 4. Devolver siempre el resultado original de la búsqueda al agente/LLM
+        return search_result
 
     async def agregar_al_carrito_wrapper(nombre_producto: str, cantidad: float) -> dict:
-        """Agrega una cantidad específica de un producto al carrito."""
-        # 'db', 'business.id', 'customer_phone' están disponibles
-        return await agregar_al_carrito_impl(nombre_producto=nombre_producto, cantidad=cantidad, db=db, business_id=business.id, customer_phone=customer_phone)
+        """
+        Wrapper simple para agregar un producto al carrito.
+        Args:
+            nombre_producto: Nombre del producto a agregar.
+            cantidad: Cantidad a agregar (puede ser float).
+        Returns:
+            Diccionario con el resultado de la operación.
+        """
+        # Este wrapper por ahora solo llama a la implementación
+        # Podría añadir lógica extra si fuera necesario (ej. verificar stock antes?)
+        return await agregar_al_carrito_impl(
+            nombre_producto=nombre_producto,
+            cantidad=cantidad,
+            db=db,
+            business_id=business.id,
+            customer_phone=customer_phone,
+        )
 
     async def ver_carrito_wrapper() -> dict:
-        """Muestra el contenido actual del carrito."""
-        return await ver_carrito_impl(db=db, business_id=business.id, customer_phone=customer_phone)
+        """
+        Wrapper simple para mostrar el contenido del carrito.
+        Returns:
+            Diccionario con el contenido del carrito o estado vacío/error.
+        """
+        # Podría añadir lógica aquí, ej. formatear la respuesta antes de devolverla al LLM
+        return await ver_carrito_impl(
+            db=db, business_id=business.id, customer_phone=customer_phone
+        )
 
     async def remover_del_carrito_wrapper(nombre_producto: str) -> dict:
-        """Elimina un producto del carrito."""
-        return await remover_del_carrito_impl(nombre_producto=nombre_producto, db=db, business_id=business.id, customer_phone=customer_phone)
+        """
+        Wrapper simple para eliminar un producto del carrito.
+        Args:
+            nombre_producto: Nombre del producto a eliminar.
+        Returns:
+            Diccionario con el resultado de la operación.
+        """
+        return await remover_del_carrito_impl(
+            nombre_producto=nombre_producto,
+            business_id=business.id,
+            customer_phone=customer_phone,
+            db=db
+        )
 
     async def modificar_cantidad_wrapper(nombre_producto: str, nueva_cantidad: float) -> dict:
-        """Modifica la cantidad de un producto en el carrito."""
-        # Nota: renombramos el parámetro en la firma para coincidir con la implementación
-
+        """
+        Wrapper simple para modificar la cantidad de un producto en el carrito.
+        Args:
+            nombre_producto: Nombre del producto a modificar.
+            nueva_cantidad: La nueva cantidad deseada (puede ser 0 para eliminar).
+        Returns:
+            Diccionario con el resultado de la operación.
+        """
+        return await modificar_cantidad_impl(
+            nombre_producto=nombre_producto,
+            nueva_cantidad=nueva_cantidad,
+            business_id=business.id,
+            customer_phone=customer_phone,
+            db=db
+        )
     # --- Instanciar el Agente con WRAPPERS y Callbacks ---
     request_agent = Agent(
         name=f"agent_for_{business.id}",
