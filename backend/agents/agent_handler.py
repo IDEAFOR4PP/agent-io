@@ -6,7 +6,6 @@ import json # Importar json para serializar argumentos/respuestas si es necesari
 from typing import Optional, Dict, Any, List
 from copy import deepcopy
 from datetime import datetime
-import functools # Importar functools
 import traceback # Importar traceback para log de errores
 import asyncio # Importar asyncio para el delay (aunque no lo usaremos directamente en el callback)
 import random # Importar random para el jitter del retry
@@ -24,7 +23,7 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.tools.tool_context import ToolContext
 from google.adk.models import LlmResponse, LlmRequest
 from google.adk.tools.base_tool import BaseTool
-from google.adk.tools import FunctionTool # Importar FunctionTool
+#from google.adk.tools import FunctionTool # Importar FunctionTool
 
 # Importaciones de herramientas y prompt (sin cambios)
 from agents.prompt_generator import generate_prompt_for_business
@@ -369,6 +368,24 @@ def before_tool_prod(tool: BaseTool, args: Dict[str, Any], tool_context: ToolCon
     # 2. CACHE MISS: Continuar con logging y validación normal
     execution_logger.log_tool_start(tool, args, tool_context) # Loguear inicio (miss)
 
+    #    ASUMIMOS que estos valores están en tool_context.state (ver process_customer_message)
+    db_session = tool_context.state.get('db_session')
+    business_id_from_state = tool_context.state.get('business_id')
+    # customer_phone_from_state = tool_context.state.get('user_id') # user_id ya está en tool_context
+
+    if not db_session or not business_id_from_state:
+         error_msg = f"Dependencias críticas (db_session o business_id) no encontradas en el estado para {tool.name}"
+         logger.error(error_msg)
+         execution_logger.update_metric('errors') # Contar error
+         return {"status": "error", "message": "Error interno de configuración del agente."}
+
+    # Añadir las dependencias a los 'args' que recibirá la función wrapper
+    args['db'] = db_session
+    args['business_id'] = business_id_from_state
+    # Ya no necesitamos añadir customer_phone si usamos tool_context.user_id en el wrapper
+    # args['customer_phone'] = tool_context.user_id
+
+
     # 3. Validación de argumentos (ejemplo para cantidad)
     if tool.name == "agregar_al_carrito" or tool.name == "modificar_cantidad":
         cantidad = args.get('cantidad')
@@ -390,7 +407,8 @@ def before_tool_prod(tool: BaseTool, args: Dict[str, Any], tool_context: ToolCon
                  logger.error(error_msg)
                  return {"status": "error", "message": "La nueva cantidad no puede ser negativa."}
 
-    # 4. Si no hubo hit de caché ni error de validación, permitir ejecución
+    # 4. Permitir ejecución (los 'args' ahora contienen las dependencias inyectadas)
+    logger.debug(f"Argumentos inyectados para {tool.name}: {args.keys()}")
     return None
 
 def after_tool_prod(tool: BaseTool, args: Dict[str, Any], tool_context: ToolContext, tool_response: Dict) -> Optional[Dict]:
@@ -477,97 +495,86 @@ async def process_customer_message(
     # Genera el prompt base para el negocio
     final_instruction = generate_prompt_for_business(business)
 
-    # --- Estado Persistente (solo datos serializables) ---
+    # --- Estado Persistente (AHORA INCLUYE DEPENDENCIAS PARA CALLBACKS) ---
     initial_state = {
-        'business_id': business.id, # business_id es serializable
-        # Otros datos serializables podrían ir aquí (ej. nivel de usuario)
-    }
-    # Cargar y fusionar estado existente de la sesión
-    current_session_data = await session_service.get_session(
-        app_name=app_name, user_id=customer_phone, session_id=session_id
-    )
+        'business_id': business.id,
+        'session_id': session_id,
+        'user_id': customer_phone,
+        }
+    # Cargar y fusionar estado existente
+    # Cargar y fusionar estado existente USANDO KEYWORD ARGUMENTS
+    current_session_data = None # Inicializar por si falla
+    try:
+        current_session_data = await session_service.get_session(
+            app_name=app_name,
+            user_id=customer_phone,
+            session_id=session_id
+        )
+    except Exception as e_get:
+        # Loguear si get_session falla, pero continuar podría ser posible
+        logger.error(f"Error al intentar obtener sesión existente {session_id}: {e_get}", exc_info=True)
+
     if current_session_data and current_session_data.state:
          initial_state.update(current_session_data.state)
-         logger.debug(f"Estado existente cargado para sesión {session_id}: {current_session_data.state.keys()}")
+         logger.debug(f"Estado existente cargado: {current_session_data.state.keys()}")
 
     initial_state['session_id'] = session_id
     initial_state['user_id'] = customer_phone
 
-    # Guardar/Actualizar el estado serializable en la sesión ANTES de ejecutar
+    state_to_save = {k: v for k, v in initial_state.items() if k != 'db_session'}
     await session_service.create_session(
-        app_name=app_name,
-        user_id=customer_phone,
-        session_id=session_id,
-        state=initial_state # Pasa el estado serializable actualizado
+        app_name=app_name, user_id=customer_phone, session_id=session_id,
+        state=state_to_save
     )
-    logger.debug(f"Estado actualizado guardado para sesión {session_id}: {initial_state.keys()}")
-
+    logger.debug(f"Estado serializable guardado: {state_to_save.keys()}")
     # --- Crear Herramientas Parciales con Dependencias (db, business_id, customer_phone) ---
     # Esto inyecta las dependencias necesarias sin usar el estado de sesión ADK para objetos no serializables
-    buscar_producto_tool_partial = functools.partial(
-        buscar_producto_impl, db=db, business_id=business.id
-    )
-    agregar_al_carrito_tool_partial = functools.partial(
-        agregar_al_carrito_impl, db=db, business_id=business.id, customer_phone=customer_phone
-    )
-    ver_carrito_tool_partial = functools.partial(
-        ver_carrito_impl, db=db, business_id=business.id, customer_phone=customer_phone
-    )
-    remover_del_carrito_tool_partial = functools.partial(
-        remover_del_carrito_impl, db=db, business_id=business.id, customer_phone=customer_phone
-    )
+    # --- INICIO: Definir Funciones Wrapper Dinámicas ---
+    async def buscar_producto_wrapper(nombre_producto: str) -> dict:
+        """Busca un producto por nombre en el inventario del negocio actual."""
+        # 'db' y 'business.id' están disponibles aquí por closure
+        return await buscar_producto_impl(nombre_producto=nombre_producto, db=db, business_id=business.id)
 
+    async def agregar_al_carrito_wrapper(nombre_producto: str, cantidad: float) -> dict:
+        """Agrega una cantidad específica de un producto al carrito."""
+        # 'db', 'business.id', 'customer_phone' están disponibles
+        return await agregar_al_carrito_impl(nombre_producto=nombre_producto, cantidad=cantidad, db=db, business_id=business.id, customer_phone=customer_phone)
 
-    modificar_cantidad_tool_partial = functools.partial(
-        modificar_cantidad_impl, db=db, business_id=business.id, customer_phone=customer_phone
-    )
+    async def ver_carrito_wrapper() -> dict:
+        """Muestra el contenido actual del carrito."""
+        return await ver_carrito_impl(db=db, business_id=business.id, customer_phone=customer_phone)
 
-    # Envolver en FunctionTool para que ADK las reconozca y obtenga su schema
-    # --- Crear Herramientas Parciales con Dependencias (sin cambios) ---
-    buscar_producto_tool_partial = functools.partial(
-        buscar_producto_impl, db=db, business_id=business.id
-    )
-    agregar_al_carrito_tool_partial = functools.partial(
-        agregar_al_carrito_impl, db=db, business_id=business.id, customer_phone=customer_phone
-    )
-    ver_carrito_tool_partial = functools.partial(
-        ver_carrito_impl, db=db, business_id=business.id, customer_phone=customer_phone
-    )
-    remover_del_carrito_tool_partial = functools.partial(
-        remover_del_carrito_impl, db=db, business_id=business.id, customer_phone=customer_phone
-    )
-    modificar_cantidad_tool_partial = functools.partial(
-        modificar_cantidad_impl, db=db, business_id=business.id, customer_phone=customer_phone
-    )
+    async def remover_del_carrito_wrapper(nombre_producto: str) -> dict:
+        """Elimina un producto del carrito."""
+        return await remover_del_carrito_impl(nombre_producto=nombre_producto, db=db, business_id=business.id, customer_phone=customer_phone)
 
-    # --- INICIO DE LA CORRECCIÓN ---
-    # Envolver en FunctionTool SIN el argumento 'name'
-    tools_list = [
-        FunctionTool(func=buscar_producto_tool_partial),
-        FunctionTool(func=agregar_al_carrito_tool_partial),
-        FunctionTool(func=ver_carrito_tool_partial),
-        FunctionTool(func=remover_del_carrito_tool_partial),
-        FunctionTool(func=modificar_cantidad_tool_partial),
-    ]
+    async def modificar_cantidad_wrapper(nombre_producto: str, nueva_cantidad: float) -> dict:
+        """Modifica la cantidad de un producto en el carrito."""
+        # Nota: renombramos el parámetro en la firma para coincidir con la implementación
 
-    # --- Instanciar el Agente específico para esta solicitud ---
+    # --- Instanciar el Agente con WRAPPERS y Callbacks ---
     request_agent = Agent(
-        name=f"agent_for_{business.id}", # Nombre dinámico del agente
-        model="gemini-2.5-flash-lite", # O el modelo configurado
-        instruction=final_instruction, # Prompt dinámico
-        tools=tools_list, # Lista de FunctionTools con dependencias inyectadas
-        # Registrar todos los callbacks para logging, cache y retry
+        name=f"agent_for_{business.id}",
+        model="gemini-2.5-flash-lite",
+        instruction=final_instruction,
+        tools=[ # Pasar las FUNCIONES WRAPPER directamente
+            buscar_producto_wrapper,
+            agregar_al_carrito_wrapper,
+            ver_carrito_wrapper,
+            remover_del_carrito_wrapper,
+            modificar_cantidad_wrapper,
+        ],
+        # Callbacks (ahora before_tool_prod necesita inyectar desde state)
         before_agent_callback=before_agent_prod,
         after_agent_callback=after_agent_prod,
         before_model_callback=before_model_prod,
         after_model_callback=after_model_prod,
-        before_tool_callback=before_tool_prod,
+        before_tool_callback=before_tool_prod, # Necesita db_session del state
         after_tool_callback=after_tool_prod,
     )
 
-    # Asignar el agente dinámico al runner para esta ejecución
     runner.agent = request_agent
-    logger.debug(f"Agente dinámico '{request_agent.name}' asignado al runner para sesión {session_id}")
+    logger.debug(f"Agente dinámico '{request_agent.name}' con WRAPPERS asignado.")
 
 
     # --- Ejecución del Agente ---
@@ -585,8 +592,8 @@ async def process_customer_message(
         # Iterar sobre los eventos generados por el runner
         async for event in events:
             # Puedes descomentar para debugging intensivo de eventos:
-            # logger.debug(f"Evento recibido: Tipo={type(event).__name__}, Final={event.is_final_response()}, Autor={event.author}")
-            # logger.debug(f"Contenido Evento: {event.content}")
+            logger.debug(f"Evento recibido: Tipo={type(event).__name__}, Final={event.is_final_response()}, Autor={event.author}")
+            logger.debug(f"Contenido Evento: {event.content}")
 
             # Buscar la respuesta final destinada al usuario
             if event.is_final_response() and event.content and event.content.parts:
@@ -631,9 +638,11 @@ async def process_customer_message(
 
     # --- Lógica Post-Ejecución (Opcional: Guardado de Memoria a Largo Plazo) ---
     try:
-        # Recuperar la sesión final puede ser útil para análisis o guardado en memoria a largo plazo
+        # Asegurarse que ESTA llamada a get_session también usa keyword arguments
         current_session = await session_service.get_session(
-            app_name=app_name, user_id=customer_phone, session_id=session_id
+            app_name=app_name,
+            user_id=customer_phone,
+            session_id=session_id
         )
         if current_session:
             logger.debug(f"Sesión {session_id} recuperada exitosamente post-ejecución.")
@@ -646,10 +655,8 @@ async def process_customer_message(
         else:
             # Esto sería inesperado si la ejecución fue exitosa
             logger.warning(f"No se pudo recuperar la sesión {session_id} post-ejecución.")
-    except Exception as e:
-        # Error al recuperar la sesión final (no crítico para la respuesta al usuario)
-        logger.error(f"Error recuperando sesión {session_id} post-ejecución: {e}", exc_info=True)
-
+    except Exception as e_get_post:
+        logger.error(f"Error recuperando sesión {session_id} post-ejecución: {e_get_post}", exc_info=True)
 
     # Devolver la respuesta final al usuario
     logger.info(f"Retornando respuesta final para sesión {session_id}")
