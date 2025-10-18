@@ -1,36 +1,449 @@
-# En backend/agents/agent_handler.py (añadir estas funciones y las importaciones necesarias)
+# En backend/agents/agent_handler.py
 
 import logging
+import time
+import json # Importar json para serializar argumentos/respuestas si es necesario
+from typing import Optional, Dict, Any, List
+from copy import deepcopy
+from datetime import datetime
+import functools # Importar functools
+import traceback # Importar traceback para log de errores
+import asyncio # Importar asyncio para el delay (aunque no lo usaremos directamente en el callback)
+import random # Importar random para el jitter del retry
+
+# Importaciones de SQLAlchemy y modelos (sin cambios)
 from sqlalchemy.ext.asyncio import AsyncSession
+import models
+
+# Importaciones de ADK (sin cambios + FunctionTool)
 from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.tools.tool_context import ToolContext
+from google.adk.models import LlmResponse, LlmRequest
+from google.adk.tools.base_tool import BaseTool
+from google.adk.tools import FunctionTool # Importar FunctionTool
 
-import models
+# Importaciones de herramientas y prompt (sin cambios)
 from agents.prompt_generator import generate_prompt_for_business
 from agents.tools.product_tools import buscar_producto as buscar_producto_impl
 from agents.tools.cart_tools import (
     agregar_al_carrito as agregar_al_carrito_impl,
     ver_carrito as ver_carrito_impl,
-    remover_del_carrito as remover_del_carrito_impl,      # <-- AÑADIR
-    modificar_cantidad as modificar_cantidad_impl,        # <-- AÑADIR
+    remover_del_carrito as remover_del_carrito_impl,
+    modificar_cantidad as modificar_cantidad_impl,
 )
 
-import time
-from typing import Optional, Dict, Any
-from copy import deepcopy
-from datetime import datetime
-
-# Importaciones de ADK para Callbacks (asegúrate de que estén presentes)
-from google.adk.agents.callback_context import CallbackContext
-from google.adk.tools.tool_context import ToolContext
-from google.adk.models import LlmResponse, LlmRequest
-from google.adk.tools.base_tool import BaseTool
-from google.genai import types # Asegúrate de importar types si no lo está
-
-# Instancia del logger (ya deberías tenerla)
+# Configuración del logger estándar de Python (sin cambios)
 logger = logging.getLogger(__name__)
+
+# --- Clase AgentExecutionLogger ---
+class AgentExecutionLogger:
+    """Clase para logging estructurado y métricas de ejecución del agente."""
+
+    def __init__(self):
+        self._metrics = {
+            'total_calls': 0,
+            'llm_calls': 0,
+            'tool_calls': 0,
+            'tool_cache_hits': 0, # Métrica nueva para cache
+            'errors': 0,
+            'total_agent_duration_ms': 0.0,
+        }
+        self._timing_stack = []
+
+    def _log(self, event_type: str, data: Dict, level: str = 'INFO'):
+        """Registra un evento estructurado usando el logger estándar."""
+        log_entry = {
+            'event_type': event_type,
+            'level': level,
+            'timestamp': datetime.now().isoformat(),
+            **data
+        }
+        log_func = getattr(logger, level.lower(), logger.info)
+        try:
+            log_func(json.dumps(log_entry, default=str))
+        except TypeError as e:
+            logger.error(f"Error al serializar log {event_type}: {e}. Datos: {log_entry}")
+
+
+    def start_timing(self, operation_key: str):
+        """Inicia un temporizador para una operación."""
+        self._timing_stack.append({'key': operation_key, 'start': time.time()})
+
+    def end_timing(self, operation_key: str) -> float:
+        """Finaliza un temporizador, registra la duración y la retorna en ms."""
+        duration_ms = 0.0
+        if self._timing_stack and self._timing_stack[-1]['key'] == operation_key:
+            timing_info = self._timing_stack.pop()
+            duration_s = time.time() - timing_info['start']
+            duration_ms = round(duration_s * 1000, 2)
+            self._log('TIMING', {'operation': operation_key, 'duration_ms': duration_ms})
+        else:
+            # No loguear como warning si es esperado (ej. error antes de agent_end)
+            pass # logger.warning(f"Error de temporización: No se encontró inicio para '{operation_key}'")
+        return duration_ms
+
+    def update_metric(self, metric_name: str, value: float = 1):
+        """Actualiza una métrica."""
+        if metric_name in self._metrics:
+            if metric_name == 'total_agent_duration_ms':
+                 self._metrics[metric_name] += value
+            else:
+                self._metrics[metric_name] += value
+        else:
+            logger.warning(f"Métrica desconocida: {metric_name}")
+
+    # --- Métodos de log específicos (log_agent_start, log_llm_request, etc.) ---
+    # (Estos métodos usan _log, start_timing, end_timing, update_metric)
+    def log_agent_start(self, context: CallbackContext):
+        self.start_timing('agent_execution')
+        self.update_metric('total_calls')
+        session_id_from_state = context.state.get('session_id', 'unknown_session') # <-- LEER DESDE ESTADO
+        user_id_from_state = context.state.get('user_id', 'unknown_user')
+        self._log('AGENT_START', {
+        'agent_name': context.agent_name,
+        'invocation_id': context.invocation_id,
+        'session_id': session_id_from_state, # <-- Usar valor del estado
+        'user_id': user_id_from_state,
+        'state_keys': list(context.state.to_dict().keys()) if context.state else []
+        })
+
+    def log_agent_end(self, context: CallbackContext):
+        duration_ms = self.end_timing('agent_execution')
+        self.update_metric('total_agent_duration_ms', duration_ms)
+        session_id_from_state = context.state.get('session_id', 'unknown_session') # <-- LEER DESDE ESTADO
+        user_id_from_state = context.state.get('user_id', 'unknown_user')
+        self._log('AGENT_END', {
+            'agent_name': context.agent_name,
+            'invocation_id': context.invocation_id,
+            'session_id': session_id_from_state, # <-- Usar valor del estado
+            'user_id': user_id_from_state,
+            'execution_time_ms': duration_ms
+        }, 'INFO')
+
+    def log_llm_request(self, context: CallbackContext, llm_request: LlmRequest):
+        self.start_timing('llm_call')
+        self.update_metric('llm_calls')
+        message_count = len(llm_request.contents) if llm_request.contents else 0
+        estimated_chars = sum(len(str(part.text)) for content in llm_request.contents if content.parts for part in content.parts if hasattr(part, 'text'))
+        session_id_from_state = context.state.get('session_id', 'unknown_session')
+        user_id_from_state = context.state.get('user_id', 'unknown_user') # <-- LEER DESDE ESTADO
+        self._log('LLM_REQUEST', {
+            'agent_name': context.agent_name,
+            'invocation_id': context.invocation_id,
+            'session_id': session_id_from_state, # <-- Usar valor del estado
+            'user_id': user_id_from_state,
+            'message_count': message_count,
+            'estimated_chars': estimated_chars,
+            'model_config': {
+                'temperature': getattr(llm_request.config, 'temperature', None),
+                'max_output_tokens': getattr(llm_request.config, 'max_output_tokens', None)
+            }
+        })
+
+    def log_llm_response(self, context: CallbackContext, llm_response: LlmResponse):
+        duration_ms = self.end_timing('llm_call')
+        response_text_preview = ""
+        function_calls = []
+        response_length = 0
+        if llm_response.content and llm_response.content.parts:
+            for part in llm_response.content.parts:
+                if hasattr(part, 'text') and part.text:
+                    response_text_preview = part.text[:80] + "..." if len(part.text) > 80 else part.text
+                    response_length += len(part.text)
+                if hasattr(part, 'function_call') and part.function_call:
+                    function_calls.append(part.function_call.name)
+        session_id_from_state = context.state.get('session_id', 'unknown_session') # <-- LEER DESDE ESTADO
+        user_id_from_state = context.state.get('user_id', 'unknown_user')
+        self._log('LLM_RESPONSE', {
+            'agent_name': context.agent_name,
+            'invocation_id': context.invocation_id,
+            'session_id': session_id_from_state, # <-- Usar valor del estado
+            'user_id': user_id_from_state,
+            'response_length': response_length,
+            'response_preview': response_text_preview,
+            'function_calls': function_calls,
+            'response_time_ms': duration_ms
+        })
+
+    def log_tool_start(self, tool: BaseTool, args: Dict[str, Any], tool_context: ToolContext):
+        self.start_timing(f'tool_{tool.name}')
+        self.update_metric('tool_calls')
+        session_id = tool_context.state.get('session_id', 'unknown_tool_session')
+        self._log('TOOL_START', {
+            'agent_name': tool_context.agent_name,
+            'invocation_id': tool_context.invocation_id,
+            'session_id': session_id,
+            'user_id': tool_context.user_id,
+            'tool_name': tool.name,
+            'args': args, # Considerar truncar
+            'state_keys': list(tool_context.state.to_dict().keys()) if tool_context.state else []
+        })
+
+    def log_tool_end(self, tool: BaseTool, args: Dict[str, Any], tool_context: ToolContext, tool_response: Dict):
+        duration_ms = self.end_timing(f'tool_{tool.name}')
+        is_success = isinstance(tool_response, dict) and tool_response.get("status", "success") not in ["error"] # Simplificado
+        level = 'INFO' if is_success else 'ERROR'
+        if not is_success:
+            self.update_metric('errors')
+        session_id = tool_context.state.get('session_id', 'unknown_tool_session')
+        self._log('TOOL_END', {
+            'agent_name': tool_context.agent_name,
+            'invocation_id': tool_context.invocation_id,
+            'session_id': session_id,
+            'user_id': tool_context.user_id,
+            'tool_name': tool.name,
+            'success': is_success,
+            'response_status': tool_response.get("status", "unknown") if isinstance(tool_response, dict) else "unknown",
+            'response_size': len(str(tool_response)),
+            'execution_time_ms': duration_ms
+        }, level)
+
+    def log_cache_hit(self, tool_name: str, args: Dict[str, Any], tool_context: ToolContext):
+        self.update_metric('tool_cache_hits') # Incrementar cache hits
+        session_id = tool_context.state.get('session_id', 'unknown_tool_session')
+        self._log('TOOL_CACHE_HIT', {
+            'agent_name': tool_context.agent_name,
+            'invocation_id': tool_context.invocation_id,
+            'session_id': session_id,
+            'user_id': tool_context.user_id,
+            'tool_name': tool_name,
+            'args': args,
+        })
+
+
+    def get_metrics(self) -> Dict:
+        """Retorna una copia de las métricas actuales."""
+        metrics_copy = self._metrics.copy()
+        if metrics_copy['total_calls'] > 0:
+             metrics_copy['avg_agent_duration_ms'] = round(
+                 metrics_copy['total_agent_duration_ms'] / metrics_copy['total_calls'], 2
+             )
+        else:
+             metrics_copy['avg_agent_duration_ms'] = 0.0
+        return metrics_copy
+
+execution_logger = AgentExecutionLogger()
+
+# --- Clase IntelligentCache ---
+class IntelligentCache:
+    """Cache inteligente con TTL y generación de claves basada en args."""
+    def __init__(self, default_ttl=300):
+        self._cache = {}
+        self._default_ttl = default_ttl
+        self._hit_count = 0
+        self._miss_count = 0
+
+    def _generate_key(self, tool_name: str, args: dict) -> str:
+        try:
+            sorted_args = json.dumps(args, sort_keys=True, default=str)
+        except TypeError:
+            sorted_args = str(sorted(args.items()))
+        return f"{tool_name}:{sorted_args}"
+
+    def get(self, tool_name: str, args: dict) -> Optional[dict]:
+        key = self._generate_key(tool_name, args)
+        entry = self._cache.get(key)
+        if entry and time.time() < entry['expires_at']:
+            self._hit_count += 1
+            # Log separado del hit hecho en before_tool_prod
+            # logger.info(f"CACHE HIT para key: {key}")
+            return deepcopy(entry['value'])
+        elif entry:
+            # logger.info(f"CACHE EXPIRED para key: {key}")
+            self._cache.pop(key, None)
+            self._miss_count += 1
+            return None
+        else:
+             self._miss_count += 1
+             # logger.info(f"CACHE MISS para key: {key}")
+             return None
+
+    def set(self, tool_name: str, args: dict, value: dict, ttl: Optional[int] = None):
+        if not isinstance(value, dict):
+             logger.warning(f"Intento de cachear valor no diccionario para {tool_name}. Ignorando.")
+             return
+        key = self._generate_key(tool_name, args)
+        ttl_to_use = ttl if ttl is not None else self._default_ttl
+        expires_at = time.time() + ttl_to_use
+        self._cache[key] = {'value': deepcopy(value), 'expires_at': expires_at}
+        logger.info(f"CACHE SET para key: {key} con TTL: {ttl_to_use}s")
+
+    def get_stats(self) -> dict:
+        total_requests = self._hit_count + self._miss_count
+        hit_rate = (self._hit_count / total_requests * 100) if total_requests > 0 else 0
+        return {
+            'hit_count': self._hit_count, 'miss_count': self._miss_count,
+            'hit_rate_percent': round(hit_rate, 2), 'current_size': len(self._cache),
+        }
+
+tool_cache = IntelligentCache()
+
+# --- Clase RetryManager ---
+class RetryManager:
+    """Gestor de reintentos con backoff exponencial."""
+    def __init__(self, max_retries=2, base_delay=0.5, max_delay=5.0):
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.retry_counts = {}
+
+    def _generate_key(self, tool_name: str, args: dict) -> str:
+        try:
+            sorted_args = json.dumps(args, sort_keys=True, default=str)
+        except TypeError:
+            sorted_args = str(sorted(args.items()))
+        return f"{tool_name}:{sorted_args}"
+
+    def should_retry(self, tool_name: str, args: dict, error_message: str) -> bool:
+        key = self._generate_key(tool_name, args)
+        retries = self.retry_counts.get(key, 0)
+        non_retryable_markers = [
+            'inválido', 'no encontrado', 'not found', 'cannot divide',
+            'no es válida', 'no puede ser negativa', 'agotado', 'out_of_stock',
+             'no manejamos'
+        ]
+        error_lower = error_message.lower()
+        if any(marker in error_lower for marker in non_retryable_markers):
+            # logger.info(f"RETRY: Error no reintentable detectado para {key}: {error_message}")
+            return False
+        should = retries < self.max_retries
+        # logger.info(f"RETRY: Evaluación para {key}. Intentos: {retries}/{self.max_retries}. Reintentable: {should}. Error: {error_message}")
+        return should
+
+    async def get_delay(self, tool_name: str, args: dict) -> float:
+        key = self._generate_key(tool_name, args)
+        retries = self.retry_counts.get(key, 0)
+        delay = min(self.base_delay * (2 ** retries), self.max_delay)
+        jitter = random.uniform(0, delay * 0.1)
+        calculated_delay = delay + jitter
+        # logger.info(f"RETRY: Delay calculado para {key} (intento {retries+1}): {calculated_delay:.2f}s")
+        return calculated_delay
+
+    def increment_retry(self, tool_name: str, args: dict):
+        key = self._generate_key(tool_name, args)
+        self.retry_counts[key] = self.retry_counts.get(key, 0) + 1
+        logger.warning(f"RETRY: Contador incrementado para {key} a {self.retry_counts[key]}")
+
+    def reset_retry(self, tool_name: str, args: dict):
+        key = self._generate_key(tool_name, args)
+        if key in self.retry_counts:
+            # logger.info(f"RETRY: Reseteando contador para {key}")
+            self.retry_counts.pop(key, None)
+
+retry_manager = RetryManager()
+
+# --- Callbacks Refactorizados (Integrando Cache y Retry) ---
+
+def before_agent_prod(callback_context: CallbackContext) -> Optional[types.Content]:
+    execution_logger.log_agent_start(callback_context)
+    return None
+
+def after_agent_prod(callback_context: CallbackContext) -> Optional[types.Content]:
+    execution_logger.log_agent_end(callback_context)
+    # Opcional: Loguear métricas o stats de caché al final
+    # logger.info(f"Métricas finales: {execution_logger.get_metrics()}")
+    # logger.info(f"Estadísticas Cache: {tool_cache.get_stats()}")
+    return None
+
+def before_model_prod(callback_context: CallbackContext, llm_request: LlmRequest) -> Optional[LlmResponse]:
+    execution_logger.log_llm_request(callback_context, llm_request)
+    return None
+
+def after_model_prod(callback_context: CallbackContext, llm_response: LlmResponse) -> Optional[LlmResponse]:
+    execution_logger.log_llm_response(callback_context, llm_response)
+    return None
+
+def before_tool_prod(tool: BaseTool, args: Dict[str, Any], tool_context: ToolContext) -> Optional[Dict]:
+    """Callback ANTES de la herramienta: Verifica caché y valida args."""
+    # 1. Intentar obtener resultado del caché
+    cached_result = tool_cache.get(tool.name, args)
+    if cached_result:
+        # ¡CACHE HIT! Loguear el hit y retornar el resultado cacheado
+        execution_logger.log_cache_hit(tool.name, args, tool_context) # Log específico
+        return cached_result # Evita ejecución
+
+    # 2. CACHE MISS: Continuar con logging y validación normal
+    execution_logger.log_tool_start(tool, args, tool_context) # Loguear inicio (miss)
+
+    # 3. Validación de argumentos (ejemplo para cantidad)
+    if tool.name == "agregar_al_carrito" or tool.name == "modificar_cantidad":
+        cantidad = args.get('cantidad')
+        is_valid_number = isinstance(cantidad, (int, float))
+        is_positive = cantidad > 0 if is_valid_number else False
+
+        if tool.name == "agregar_al_carrito" and (not is_valid_number or not is_positive):
+             error_msg = f"Argumento 'cantidad' inválido para {tool.name}: {cantidad}. Debe ser un número positivo."
+             logger.error(error_msg)
+             # Importante: Retornar error detiene la ejecución y ADK lo envía al LLM
+             return {"status": "error", "message": "La cantidad proporcionada para agregar no es válida."}
+        elif tool.name == "modificar_cantidad":
+             if not is_valid_number:
+                 error_msg = f"Argumento 'nueva_cantidad' inválido para {tool.name}: {cantidad}. Debe ser un número."
+                 logger.error(error_msg)
+                 return {"status": "error", "message": "La nueva cantidad proporcionada no es válida."}
+             elif cantidad < 0: # Permitir 0, pero no negativo
+                 error_msg = f"Argumento 'nueva_cantidad' negativo inválido para {tool.name}: {cantidad}."
+                 logger.error(error_msg)
+                 return {"status": "error", "message": "La nueva cantidad no puede ser negativa."}
+
+    # 4. Si no hubo hit de caché ni error de validación, permitir ejecución
+    return None
+
+def after_tool_prod(tool: BaseTool, args: Dict[str, Any], tool_context: ToolContext, tool_response: Dict) -> Optional[Dict]:
+    """Callback DESPUÉS de la herramienta: Loguea, guarda en caché y maneja reintentos."""
+    # 1. Loguear fin de ejecución y métricas
+    execution_logger.log_tool_end(tool, args, tool_context, tool_response)
+
+    # Crear clave única
+    operation_key = retry_manager._generate_key(tool.name, args)
+
+    # 2. Determinar si la ejecución fue exitosa
+    # Considerar 'empty' y 'success' como éxito para caché/retry reset
+    is_success = isinstance(tool_response, dict) and tool_response.get("status") in ["success", "empty"]
+
+    if is_success:
+        # 2a. Éxito: Resetear contador de reintentos y guardar en caché
+        retry_manager.reset_retry(tool.name, args)
+
+        # Guardar en caché si aplica
+        ttl = None
+        if tool.name == 'buscar_producto': ttl = 600
+        elif tool.name == 'ver_carrito': ttl = 30 # TTL corto para ver carrito
+        if ttl is not None:
+             tool_cache.set(tool.name, args, tool_response, ttl=ttl)
+        return None # Usar la respuesta original
+
+    else:
+        # 2b. Error: Verificar si es reintentable
+        error_message = tool_response.get("message", "Error desconocido") if isinstance(tool_response, dict) else "Respuesta inválida"
+
+        if retry_manager.should_retry(tool.name, args, error_message):
+            # Sí reintentar: Incrementar contador y preparar respuesta para LLM
+            retry_manager.increment_retry(tool.name, args)
+            # Calculamos el delay pero no lo usamos para esperar aquí
+            # delay = await retry_manager.get_delay(tool.name, args) # No podemos hacer await aquí
+
+            retry_response = {
+                "status": "error_temporal", # Nuevo status
+                "message": f"Hubo un problema temporal al ejecutar {tool.name}. El sistema podría intentar de nuevo. Por favor, espera o intenta una acción diferente.",
+                "original_error": error_message,
+                "retry_attempt": retry_manager.retry_counts.get(operation_key, 0)
+            }
+            logger.warning(f"RETRY: Error reintentable en {tool.name}. Informando al LLM. Intento {retry_response['retry_attempt']}/{retry_manager.max_retries}.")
+            return retry_response # Devolver respuesta modificada al LLM
+        else:
+            # No reintentar
+            logger.error(f"RETRY: Error final no reintentable o límite alcanzado para {tool.name}. Error: {error_message}")
+            if retry_manager.retry_counts.get(operation_key, 0) >= retry_manager.max_retries:
+                 retry_manager.reset_retry(tool.name, args) # Resetear si fue por límite
+            return None # Usar tool_response original con el error final
+
+
+# --- Función principal process_customer_message ---
 
 async def ensure_session(
     session_service: InMemorySessionService, app_name: str, user_id: str, session_id: str
@@ -42,105 +455,6 @@ async def ensure_session(
             app_name=app_name, user_id=user_id, session_id=session_id
         )
 
-# --- Funciones de Callback ---
-
-def log_callback_event(event_name: str, context: CallbackContext, details: Optional[Dict] = None):
-    """Función de utilidad para loguear eventos de callback de forma estandarizada."""
-    log_data = {
-        "event": event_name,
-        "agent": context.agent_name,
-        "invocation_id": context.invocation_id,
-        "session_id": context.session_id,
-        "user_id": context.user_id,
-    }
-    if details:
-        log_data.update(details)
-    logger.info(log_data)
-
-# -- Callbacks de Agente --
-def before_agent_prod(callback_context: CallbackContext) -> Optional[types.Content]:
-    """Se ejecuta ANTES de que el agente procese el mensaje."""
-    callback_context.state['start_time'] = time.time() # Guardar tiempo de inicio en el estado
-    log_callback_event("AgentStart", callback_context)
-    return None # Continuar
-
-def after_agent_prod(callback_context: CallbackContext) -> Optional[types.Content]:
-    """Se ejecuta DESPUÉS de que el agente termina (respuesta final o error)."""
-    start_time = callback_context.state.get('start_time', time.time())
-    duration_ms = round((time.time() - start_time) * 1000, 2)
-    log_callback_event("AgentEnd", callback_context, {"duration_ms": duration_ms})
-    # Aquí podríamos añadir métricas a Prometheus/Datadog, etc.
-    return None # Usar la respuesta generada
-
-# -- Callbacks de Modelo (LLM) --
-def before_model_prod(callback_context: CallbackContext, llm_request: LlmRequest) -> Optional[LlmResponse]:
-    """Se ejecuta ANTES de llamar al LLM."""
-    num_messages = len(llm_request.contents) if llm_request.contents else 0
-    # Podríamos añadir validación de prompt aquí si fuera necesario (Patrón Guardián)
-    log_callback_event("LlmRequest", callback_context, {"num_messages": num_messages})
-    callback_context.state['llm_start_time'] = time.time()
-    return None # Continuar
-
-def after_model_prod(callback_context: CallbackContext, llm_response: LlmResponse) -> Optional[LlmResponse]:
-    """Se ejecuta DESPUÉS de recibir la respuesta del LLM."""
-    llm_start_time = callback_context.state.get('llm_start_time', time.time())
-    duration_ms = round((time.time() - llm_start_time) * 1000, 2)
-    has_function_call = False
-    response_text_preview = ""
-    if llm_response.content and llm_response.content.parts:
-        for part in llm_response.content.parts:
-            if hasattr(part, 'function_call') and part.function_call:
-                has_function_call = True
-            if hasattr(part, 'text') and part.text:
-                response_text_preview = part.text[:50] + "..." if len(part.text) > 50 else part.text
-
-    log_callback_event("LlmResponse", callback_context, {
-        "duration_ms": duration_ms,
-        "has_function_call": has_function_call,
-        "response_preview": response_text_preview
-    })
-    # Aquí podríamos añadir validación de respuesta (Patrón Guardián)
-    return None # Usar la respuesta del LLM
-
-# -- Callbacks de Herramientas --
-def before_tool_prod(tool: BaseTool, args: Dict[str, Any], tool_context: ToolContext) -> Optional[Dict]:
-    """Se ejecuta ANTES de ejecutar una herramienta."""
-    log_callback_event("ToolStart", tool_context, {"tool_name": tool.name, "args": args})
-    tool_context.state['tool_start_time'] = time.time()
-
-    # --- Inyección de Contexto Dinámico ---
-    # Añadimos automáticamente los argumentos que nuestras tools necesitan
-    # Esto elimina la necesidad de los wrappers dentro de process_customer_message
-    if 'db' not in args:
-        args['db'] = tool_context.state.get('db_session')
-    if 'business_id' not in args:
-        args['business_id'] = tool_context.state.get('business_id')
-    if 'customer_phone' not in args:
-        args['customer_phone'] = tool_context.user_id # user_id es el customer_phone
-
-    # Validación básica de argumentos (ejemplo)
-    if tool.name == "agregar_al_carrito" or tool.name == "modificar_cantidad":
-        if not isinstance(args.get('cantidad'), (int, float)) or args.get('cantidad') < 0:
-            logger.error(f"Argumento 'cantidad' inválido para {tool.name}: {args.get('cantidad')}")
-            return {"status": "error", "message": "La cantidad proporcionada no es válida."} # Evita la ejecución
-
-    return None # Permite la ejecución de la herramienta con los args (posiblemente modificados)
-
-def after_tool_prod(tool: BaseTool, args: Dict[str, Any], tool_context: ToolContext, tool_response: Dict) -> Optional[Dict]:
-    """Se ejecuta DESPUÉS de ejecutar una herramienta."""
-    tool_start_time = tool_context.state.get('tool_start_time', time.time())
-    duration_ms = round((time.time() - tool_start_time) * 1000, 2)
-    status = "success" if isinstance(tool_response, dict) and tool_response.get("status") in ["success", "empty"] else "error"
-
-    log_callback_event("ToolEnd", tool_context, {
-        "tool_name": tool.name,
-        "status": status,
-        "duration_ms": duration_ms,
-        # "response": tool_response # Cuidado: Puede ser muy grande
-    })
-    # Podríamos modificar la respuesta aquí si fuera necesario
-    return None # Usa la respuesta original de la herramienta
-
 async def process_customer_message(
     user_message: str,
     customer_phone: str,
@@ -148,53 +462,101 @@ async def process_customer_message(
     db: AsyncSession,
     runner: Runner,
     session_service: InMemorySessionService
-    # Ya no necesitamos pasar memory_service aquí si lo integramos globalmente
+    # memory_service: Optional[YourMemoryServiceClass] = None # Placeholder para memoria futura
 ) -> str:
     """
-    Orquesta la lógica de IA usando Callbacks para monitorización y control.
+    Orquesta la lógica de IA usando Callbacks para monitorización, control,
+    caching, reintentos e inyección de dependencias con functools.partial.
     """
     app_name = "whsp_ai_sales_agent"
     session_id = f"{business.whatsapp_number}-{customer_phone}"
 
-    # Asegura la sesión
-    await ensure_session(
-        session_service=session_service, app_name=app_name, user_id=customer_phone, session_id=session_id
-    )
+    # Asegura la sesión exista en el servicio
+    await ensure_session(session_service, app_name, customer_phone, session_id)
 
-    # --- Lógica de Memoria (Si está integrada globalmente, se recupera aquí) ---
-    # memory_service = # obtener de app.state si se movió a lifespan
-    # search_results = await memory_service.search_memory(...)
-    # final_instruction = ... (crear prompt con memoria recuperada)
-    # Si no, generar prompt dinámico sin memoria por ahora:
+    # Genera el prompt base para el negocio
     final_instruction = generate_prompt_for_business(business)
 
-    # --- Estado Inicial para Callbacks ---
-    # Pasamos datos necesarios a los callbacks a través del estado
+    # --- Estado Persistente (solo datos serializables) ---
     initial_state = {
-        'db_session': db,
-        'business_id': business.id,
-        # 'customer_phone': customer_phone # user_id ya está en el contexto
+        'business_id': business.id, # business_id es serializable
+        # Otros datos serializables podrían ir aquí (ej. nivel de usuario)
     }
-    # Cargamos el estado existente de la sesión si lo hubiera
-    current_session_data = await session_service.get_session(app_name, customer_phone, session_id)
+    # Cargar y fusionar estado existente de la sesión
+    current_session_data = await session_service.get_session(
+        app_name=app_name, user_id=customer_phone, session_id=session_id
+    )
     if current_session_data and current_session_data.state:
          initial_state.update(current_session_data.state)
+         logger.debug(f"Estado existente cargado para sesión {session_id}: {current_session_data.state.keys()}")
+
+    initial_state['session_id'] = session_id
+    initial_state['user_id'] = customer_phone
+
+    # Guardar/Actualizar el estado serializable en la sesión ANTES de ejecutar
+    await session_service.create_session(
+        app_name=app_name,
+        user_id=customer_phone,
+        session_id=session_id,
+        state=initial_state # Pasa el estado serializable actualizado
+    )
+    logger.debug(f"Estado actualizado guardado para sesión {session_id}: {initial_state.keys()}")
+
+    # --- Crear Herramientas Parciales con Dependencias (db, business_id, customer_phone) ---
+    # Esto inyecta las dependencias necesarias sin usar el estado de sesión ADK para objetos no serializables
+    buscar_producto_tool_partial = functools.partial(
+        buscar_producto_impl, db=db, business_id=business.id
+    )
+    agregar_al_carrito_tool_partial = functools.partial(
+        agregar_al_carrito_impl, db=db, business_id=business.id, customer_phone=customer_phone
+    )
+    ver_carrito_tool_partial = functools.partial(
+        ver_carrito_impl, db=db, business_id=business.id, customer_phone=customer_phone
+    )
+    remover_del_carrito_tool_partial = functools.partial(
+        remover_del_carrito_impl, db=db, business_id=business.id, customer_phone=customer_phone
+    )
 
 
-    # --- Instanciar el Agente con Callbacks ---
-    # Pasamos las implementaciones directas de las tools
+    modificar_cantidad_tool_partial = functools.partial(
+        modificar_cantidad_impl, db=db, business_id=business.id, customer_phone=customer_phone
+    )
+
+    # Envolver en FunctionTool para que ADK las reconozca y obtenga su schema
+    # --- Crear Herramientas Parciales con Dependencias (sin cambios) ---
+    buscar_producto_tool_partial = functools.partial(
+        buscar_producto_impl, db=db, business_id=business.id
+    )
+    agregar_al_carrito_tool_partial = functools.partial(
+        agregar_al_carrito_impl, db=db, business_id=business.id, customer_phone=customer_phone
+    )
+    ver_carrito_tool_partial = functools.partial(
+        ver_carrito_impl, db=db, business_id=business.id, customer_phone=customer_phone
+    )
+    remover_del_carrito_tool_partial = functools.partial(
+        remover_del_carrito_impl, db=db, business_id=business.id, customer_phone=customer_phone
+    )
+    modificar_cantidad_tool_partial = functools.partial(
+        modificar_cantidad_impl, db=db, business_id=business.id, customer_phone=customer_phone
+    )
+
+    # --- INICIO DE LA CORRECCIÓN ---
+    # Envolver en FunctionTool SIN el argumento 'name'
+    tools_list = [
+        FunctionTool(func=buscar_producto_tool_partial),
+        FunctionTool(func=agregar_al_carrito_tool_partial),
+        FunctionTool(func=ver_carrito_tool_partial),
+        FunctionTool(func=remover_del_carrito_tool_partial),
+        FunctionTool(func=modificar_cantidad_tool_partial),
+    ]
+
+    # --- Instanciar el Agente específico para esta solicitud ---
     request_agent = Agent(
-        name=f"agent_for_{business.id}",
+        name=f"agent_for_{business.id}", # Nombre dinámico del agente
         model="gemini-2.5-flash-lite", # O el modelo configurado
-        instruction=final_instruction,
-        tools=[
-            buscar_producto_impl,
-            agregar_al_carrito_impl,
-            ver_carrito_impl,
-            remover_del_carrito_impl,
-            modificar_cantidad_impl,
-        ],
-        # Registrar los callbacks de producción
+        instruction=final_instruction, # Prompt dinámico
+        tools=tools_list, # Lista de FunctionTools con dependencias inyectadas
+        # Registrar todos los callbacks para logging, cache y retry
         before_agent_callback=before_agent_prod,
         after_agent_callback=after_agent_prod,
         before_model_callback=before_model_prod,
@@ -203,32 +565,94 @@ async def process_customer_message(
         after_tool_callback=after_tool_prod,
     )
 
+    # Asignar el agente dinámico al runner para esta ejecución
     runner.agent = request_agent
+    logger.debug(f"Agente dinámico '{request_agent.name}' asignado al runner para sesión {session_id}")
+
 
     # --- Ejecución del Agente ---
     content = types.Content(role="user", parts=[types.Part(text=user_message)])
     final_response_text = "Lo siento, tuve un problema para procesar tu mensaje." # Valor por defecto
 
     try:
+        # Llamar a run_async SIN el argumento initial_state
         events = runner.run_async(
             user_id=customer_phone,
             session_id=session_id,
-            new_message=content,
-            initial_state=initial_state # <-- Pasamos el estado inicial
+            new_message=content
         )
+
+        # Iterar sobre los eventos generados por el runner
         async for event in events:
+            # Puedes descomentar para debugging intensivo de eventos:
+            # logger.debug(f"Evento recibido: Tipo={type(event).__name__}, Final={event.is_final_response()}, Autor={event.author}")
+            # logger.debug(f"Contenido Evento: {event.content}")
+
+            # Buscar la respuesta final destinada al usuario
             if event.is_final_response() and event.content and event.content.parts:
-                final_response_text = event.content.parts[0].text
-                break
+                # Asegurarse de que la primera parte contenga texto
+                if hasattr(event.content.parts[0], 'text'):
+                    final_response_text = event.content.parts[0].text
+                    logger.info(f"Respuesta final del agente obtenida para sesión {session_id}")
+                else:
+                    # Caso raro donde la respuesta final no tiene texto (ej. solo llamada a función fallida?)
+                    logger.warning(f"Respuesta final del agente para {session_id} no contenía texto: {event.content.parts}")
+                    # Mantener mensaje de error por defecto o definir uno específico
+                break # Salir del bucle al encontrar la respuesta final
+            elif event.is_final_response() and event.error_message:
+                 # Manejar caso donde la respuesta final es un error del agente
+                 logger.error(f"Agente finalizó con error para sesión {session_id}: {event.error_message}")
+                 final_response_text = "Hubo un problema procesando tu solicitud. Por favor, intenta de nuevo."
+                 execution_logger.update_metric('errors') # Contar como error
+                 break
+
+
     except Exception as e:
-        logger.error(f"Error durante la ejecución del runner del ADK: {e}", exc_info=True)
-        # Podríamos usar un callback de error aquí también
-        return "Hubo un inconveniente técnico, por favor intenta de nuevo más tarde."
+        # Capturar cualquier excepción inesperada durante la ejecución del runner
+        logger.critical(f"Excepción CRÍTICA durante runner.run_async para sesión {session_id}: {e}", exc_info=True)
+        # Loguear error estructurado
+        execution_logger._log('AGENT_CRITICAL_ERROR', {
+            'agent_name': runner.agent.name if runner.agent else 'unknown',
+            'invocation_id': 'unknown', # No disponible fácilmente en este punto
+            'session_id': session_id,
+            'user_id': customer_phone,
+            'error_message': str(e),
+            'traceback': traceback.format_exc()
+        }, 'CRITICAL')
+        execution_logger.update_metric('errors') # Contar como error
+        # Devolver mensaje genérico al usuario
+        return "Hubo un inconveniente técnico mayor, por favor intenta de nuevo más tarde."
+    finally:
+        # Asegurarse de que el temporizador principal del agente siempre se detenga
+         if execution_logger._timing_stack and execution_logger._timing_stack[-1]['key'] == 'agent_execution':
+             # Si after_agent_prod no se llamó (ej. error antes de finalizar), detenerlo aquí
+             execution_logger.end_timing('agent_execution')
 
-    # --- Guardado de Memoria (Si está integrada globalmente) ---
-    # current_session = await session_service.get_session(...)
-    # if current_session:
-    #     await memory_service.add_session_to_memory(current_session)
-    #     logger.info(...)
 
+    # --- Lógica Post-Ejecución (Opcional: Guardado de Memoria a Largo Plazo) ---
+    try:
+        # Recuperar la sesión final puede ser útil para análisis o guardado en memoria a largo plazo
+        current_session = await session_service.get_session(
+            app_name=app_name, user_id=customer_phone, session_id=session_id
+        )
+        if current_session:
+            logger.debug(f"Sesión {session_id} recuperada exitosamente post-ejecución.")
+            # if memory_service:
+            #     try:
+            #         await memory_service.add_session_to_memory(current_session)
+            #         logger.info(f"Sesión {session_id} guardada en memoria a largo plazo.")
+            #     except Exception as mem_e:
+            #         logger.error(f"Error guardando sesión {session_id} en memoria: {mem_e}", exc_info=True)
+        else:
+            # Esto sería inesperado si la ejecución fue exitosa
+            logger.warning(f"No se pudo recuperar la sesión {session_id} post-ejecución.")
+    except Exception as e:
+        # Error al recuperar la sesión final (no crítico para la respuesta al usuario)
+        logger.error(f"Error recuperando sesión {session_id} post-ejecución: {e}", exc_info=True)
+
+
+    # Devolver la respuesta final al usuario
+    logger.info(f"Retornando respuesta final para sesión {session_id}")
     return final_response_text
+
+# --- FIN: Función principal process_customer_message ---
