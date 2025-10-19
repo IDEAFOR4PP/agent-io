@@ -8,18 +8,14 @@ Base = declarative_base()
 class Customer(Base):
     __tablename__ = 'customers'
     id = Column(Integer, primary_key=True)
-    phone_number = Column(String, unique=True, nullable=False) # WhatsApp ID
+    phone_number = Column(String, unique=True, nullable=False)
     name = Column(String)
     address = Column(String)
     
-    # --- RELACIONES ACTUALIZADAS ---
     orders = relationship("Order", back_populates="customer")
-    # Relación uno-a-uno con el perfil de facturación
     billing_profile = relationship("Billing", back_populates="customer", uselist=False)
-    # Relación uno-a-muchos con los pagos
     payments = relationship("Payment", back_populates="customer")
-    # --- FIN DE ACTUALIZACIÓN ---
-
+    
 class Product(Base):
     __tablename__ = 'products'
     id = Column(Integer, primary_key=True)
@@ -68,17 +64,18 @@ class Business(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
     whatsapp_number = Column(String, unique=True, nullable=False)
-    whatsapp_number_id = Column(String, unique=True, nullable=True) 
+    whatsapp_number_id = Column(String, unique=True, nullable=True)
     business_type = Column(String, nullable=False)
     personality_description = Column(String)
-    
-    # --- RELACIONES ACTUALIZADAS ---
+
+    # --- INICIO DE LA CORRECCIÓN ROBUSTA ---
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=True)
+    # Especificamos explícitamente qué columna usar para la relación 'owner'
+    owner = relationship("User", back_populates="businesses", foreign_keys=[user_id])
+    # --- FIN DE LA CORRECCIÓN ---
+
     products = relationship("Product", back_populates="business")
     orders = relationship("Order", back_populates="business")
-    # Relación uno-a-muchos con los usuarios (empleados/dueños)
-    users = relationship("User", back_populates="business")
-    # --- FIN DE ACTUALIZACIÓN ---
-
 # =============================================================================
 # --- INICIO DE NUEVAS TABLAS (USERS, BILLING, PAYMENTS) ---
 # =============================================================================
@@ -89,19 +86,17 @@ class User(Base):
     """
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
-    business_id = Column(Integer, ForeignKey('businesses.id'), nullable=False)
-    
     first_name = Column(String(255), nullable=False)
     last_name = Column(String(255), nullable=False)
     mothers_last_name = Column(String(255))
     age = Column(Integer)
     rfc = Column(String(20), unique=True)
-    address = Column(String)
+    address = Column(TEXT)
     email = Column(String(255), nullable=False, unique=True)
-    password = Column(String, nullable=False) # Almacenará un hash
+    password = Column(TEXT, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    businesses = relationship("Business", back_populates="owner", foreign_keys="[Business.user_id]")
     
-    business = relationship("Business", back_populates="users")
 
 class Billing(Base):
     """
