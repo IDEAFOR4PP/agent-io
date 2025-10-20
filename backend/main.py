@@ -59,7 +59,7 @@ SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32)) # Cargar desde e
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30 # Tiempo de validez del token
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["argon2", "bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token") # Endpoint de login
 
 # --- Funciones de Utilidad de Seguridad ---
@@ -78,6 +78,67 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+
+async def process_inventory_file(inventory_content: str, business_id: int):
+    """
+    Tarea en segundo plano para leer un CSV de inventario.
+    Procesa cada fila individualmente para ser resiliente a errores
+    de formato o de duplicados dentro del mismo archivo.
+    """
+    logger.info(f"Iniciando procesamiento de inventario para el negocio ID: {business_id}")
+    
+    products_added_count = 0
+    # ¡IMPORTANTE! Usa AsyncSessionLocal para crear una sesión de BD 
+    # independiente para esta tarea en segundo plano.
+    async with AsyncSessionLocal() as db: 
+        try:
+            stream = io.StringIO(inventory_content)
+            reader = csv.reader(stream)
+            next(reader, None) # Omitir cabecera
+
+            for row_number, row in enumerate(reader, 1):
+                if not row:
+                    continue
+
+                try:
+                    name = row[1].strip()
+                    price_str = row[3].strip()
+
+                    if not name or not price_str:
+                        logger.warning(f"Fila {row_number} omitida para negocio {business_id}: Nombre o precio vacíos.")
+                        continue
+                    
+                    price = float(price_str)
+                    
+                    sku = row[0].strip() if len(row) > 0 and row[0] else f"SKU-AUTOGEN-{row_number}"
+                    description = row[2].strip() if len(row) > 2 else None
+                    unit = row[4].strip() if len(row) > 4 and row[4] else 'pieza'
+                    
+                    new_product = models.Product(
+                        sku=sku, name=name, description=description, price=price,
+                        unit=unit, business_id=business_id, availability_status='CONFIRMED'
+                    )
+                    
+                    db.add(new_product)
+                    await db.commit() # Intenta guardar este producto inmediatamente
+                    await db.refresh(new_product) 
+                    products_added_count += 1
+
+                except (IndexError, ValueError) as e:
+                    logger.warning(f"Fila {row_number} omitida para negocio {business_id} (formato inválido): {row}. Error: {e}")
+                    await db.rollback() 
+                except IntegrityError as e:
+                    logger.warning(f"Fila {row_number} omitida para negocio {business_id} (SKU duplicado en el archivo): {row}. Error: {e}")
+                    await db.rollback() 
+
+            logger.info(f"Procesamiento de inventario completado. Se añadieron {products_added_count} productos al negocio ID: {business_id}")
+
+        except Exception as e:
+            logger.error(f"Error crítico procesando el archivo de inventario para negocio {business_id}: {e}", exc_info=True)
+            await db.rollback()
+
+
 
 async def get_current_user_dependency(token: Annotated[str, Depends(oauth2_scheme)], db: AsyncSession = Depends(get_db)) -> models.User:
     credentials_exception = HTTPException(
@@ -217,13 +278,30 @@ async def register_user(user_in: schemas.UserCreate, db: AsyncSession = Depends(
         return new_user
     except IntegrityError as e: # <-- Error específico
         await db.rollback()
-        error_detail = "Email or RFC already registered."
-        # Ser más específico sobre el error de integridad
-        if "users_email_key" in str(e).lower() or "unique constraint" in str(e).lower() and "email" in str(e).lower():
-            error_detail = "El correo electrónico ya está registrado."
-        elif "users_rfc_key" in str(e).lower() or "unique constraint" in str(e).lower() and "rfc" in str(e).lower():
-             error_detail = "El RFC ya está registrado."
-        logger.warning(f"Error de integridad al registrar {user_in.email}: {error_detail} - {e}") # <-- LOGGING AÑADIDO
+        error_detail = "Error de integridad desconocido."
+        
+        if e.orig and hasattr(e.orig, 'sqlstate'):
+            sqlstate = e.orig.sqlstate
+            # '23505' es el código estándar de PostgreSQL para 'unique_violation'
+            if sqlstate == '23505':
+                if "users_email_key" in str(e).lower() or "unique constraint" in str(e).lower() and "email" in str(e).lower():
+                    error_detail = "El correo electrónico ya está registrado."
+                elif "users_rfc_key" in str(e).lower() or "unique constraint" in str(e).lower() and "rfc" in str(e).lower():
+                    error_detail = "El RFC ya está registrado."
+                else:
+                    error_detail = "Violación de restricción única (ej. email o RFC duplicado)."
+            # '23502' es para 'not_null_violation' (el error que acabas de ver)
+            elif sqlstate == '23502':
+                error_detail = f"Violación de 'NOT NULL'. Falta un valor requerido. Detalle: {e.orig.message}"
+            else:
+                error_detail = f"Error de SQLSTATE {sqlstate}. Detalle: {e.orig.message}"
+        else:
+             error_detail = str(e) # Fallback si no podemos obtener el código SQL
+
+        # Loguea el error real y detallado para ti
+        logger.warning(f"Error de integridad al registrar {user_in.email}: {error_detail}", exc_info=True)
+        
+        # Devuelve el error específico al cliente
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail=error_detail)
     except Exception as e: # <-- Error genérico (Mejorado)
@@ -339,7 +417,7 @@ async def upload_inventory_csv(
         await inventory_file.close()
 
     # 4. Enviar a tarea en segundo plano (Función 'process_inventory_file' debe estar definida en este archivo o importada)
-    # background_tasks.add_task(process_inventory_file, inventory_content_str, business.id) # Asumiendo que process_inventory_file existe
+    background_tasks.add_task(process_inventory_file, inventory_content_str, business.id) # Asumiendo que process_inventory_file existe
     logger.info(f"Inventory processing task added for business ID: {business.id} (Filename: {inventory_file.filename})") # <-- LOGGING MEJORADO
 
     # 5. Devolver respuesta inmediata
