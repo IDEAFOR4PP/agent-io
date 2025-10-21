@@ -49,7 +49,6 @@ class BusinessRead(BusinessBase):
 
 # --- Facturación (Billing) ---
 class BillingBase(BaseModel):
-    customer_id: int
     name: str = Field(..., min_length=1, max_length=255)
     email: EmailStr
     business_address: Optional[str] = None
@@ -65,6 +64,8 @@ class BillingCreate(BillingBase):
 class BillingRead(BillingBase):
     id: int
     created_at: datetime
+    customer_id: Optional[int] = None
+    user_id: Optional[int] = None
     model_config = ConfigDict(from_attributes=True)
 
 class BillingUpdate(BaseModel): # Para PATCH
@@ -80,31 +81,40 @@ class BillingUpdate(BaseModel): # Para PATCH
 
 # --- Pagos (Payments) ---
 class PaymentBase(BaseModel):
-    order_id: int
-    customer_id: int
-    billing_id: int
     total_amount: float = Field(..., gt=0)
     tax_amount: float = Field(0.0, ge=0)
     discount: float = Field(0.0, ge=0)
     currency: str = Field('MXN', max_length=10)
     status: str = Field('pending', max_length=50)
     payment_method: Optional[str] = Field(None, max_length=100)
-    bank_reference: Optional[str] = Field(None, max_length=255)
-    authorization_code: Optional[str] = Field(None, max_length=255)
+    payment_description: Optional[str] = Field(None, max_length=255)
+    
 
 class PaymentCreate(PaymentBase):
     pass
 
+# Esquema para crear un pago de SUSCRIPCIÓN (Fase 1)
+class SubscriptionPaymentCreate(PaymentBase):
+    billing_id: int
+
+# Esquema para crear un pago de PEDIDO (Fase 2)
+class OrderPaymentCreate(PaymentBase):
+    order_id: int
+    billing_id: int
+
 class PaymentRead(PaymentBase):
     id: int
     created_at: datetime
+    order_id: Optional[int] = None
+    customer_id: Optional[int] = None
+    user_id: Optional[int] = None
+    billing_id: int
     model_config = ConfigDict(from_attributes=True)
 
 class PaymentUpdate(BaseModel): # Para PATCH (ej. actualizar status)
     status: Optional[str] = Field(None, max_length=50)
     payment_method: Optional[str] = Field(None, max_length=100)
-    bank_reference: Optional[str] = Field(None, max_length=255)
-    authorization_code: Optional[str] = Field(None, max_length=255)
+    
 
 # --- Inventario ---
 class InventoryUploadResponse(BaseModel):

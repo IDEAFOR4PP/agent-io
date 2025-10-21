@@ -429,162 +429,408 @@ async def upload_inventory_csv(
 
 
 # --- Endpoints para Facturación (Billing) ---
-@router_billing.post("/", response_model=schemas.BillingRead, status_code=status.HTTP_201_CREATED)
-async def create_billing_profile(
+
+@router_billing.post("/user", response_model=schemas.BillingRead, status_code=status.HTTP_201_CREATED)
+async def create_user_billing_profile(
     billing_in: schemas.BillingCreate,
-    current_user: CurrentUser, # <-- Argumento sin default PRIMERO
+    current_user: CurrentUser, # Dependencia de usuario autenticado
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Crea un perfil de facturación para un cliente.
-    (Necesita lógica de autorización definida: ¿Quién puede crear esto?).
+    (Fase 1) Crea un perfil de facturación para el USUARIO (dueño) autenticado
+    para el pago de la suscripción.
     """
-    logger.info(f"Usuario {current_user.email} intentando crear perfil de facturación para customer_id: {billing_in.customer_id}") # <-- LOGGING AÑADIDO
-    customer = await db.get(models.Customer, billing_in.customer_id)
-    if not customer:
-         logger.warning(f"Creación de billing fallida: Customer {billing_in.customer_id} no encontrado.") # <-- LOGGING AÑADIDO
-         raise HTTPException(status_code=404, detail=f"Customer with ID {billing_in.customer_id} not found.")
-    # TODO: Añadir lógica de autorización aquí
+    logger.info(f"Usuario {current_user.email} (ID: {current_user.id}) intentando crear su perfil de facturación.")
+    
+    # 1. Verificar si el usuario ya tiene un perfil de facturación
+    # (Asumiendo que has añadido la FK 'user_id' a la tabla 'Billing' como propusimos)
+    existing_profile = await db.execute(
+        select(models.Billing).where(models.Billing.user_id == current_user.id)
+    )
+    if existing_profile.scalars().first():
+        logger.warning(f"Conflicto al crear perfil de facturación: Usuario {current_user.email} ya tiene uno.")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Este usuario ya tiene un perfil de facturación registrado."
+        )
 
-    new_billing = models.Billing(**billing_in.model_dump())
+    # 2. Crear el nuevo objeto de facturación, vinculándolo al usuario
+    new_billing = models.Billing(
+        **billing_in.model_dump(),
+        user_id=current_user.id  # <-- Vínculo clave al Usuario
+        # customer_id se deja como NULL
+    )
     db.add(new_billing)
+
+    # 3. Intentar guardar en la BD (con el manejo de errores robusto de tu main.py)
     try:
         await db.commit()
         await db.refresh(new_billing)
-        logger.info(f"Perfil de facturación creado (ID: {new_billing.id}) para customer_id: {billing_in.customer_id}") # <-- LOGGING AÑADIDO
+        logger.info(f"Perfil de facturación (ID: {new_billing.id}) creado exitosamente para el usuario {current_user.email}.")
         return new_billing
-    except IntegrityError as e: # <-- Error específico
+        
+    except IntegrityError as e:
         await db.rollback()
-        logger.warning(f"Error de integridad al crear billing para customer_id {billing_in.customer_id}: {e}", exc_info=True) # <-- LOGGING AÑADIDO
-        raise HTTPException(status_code=409, detail="Billing profile already exists for this customer or duplicate email/RFC.")
-    except Exception as e: # <-- Error genérico
+        
+        # Lógica de logging de errores adaptada de tu endpoint register_user
+        error_detail = "Error de integridad desconocido."
+        
+        if e.orig and hasattr(e.orig, 'sqlstate'):
+            sqlstate = e.orig.sqlstate
+            # '23505' es 'unique_violation'
+            if sqlstate == '23505':
+                if "billing_user_id_key" in str(e).lower():
+                    error_detail = "Este usuario ya tiene un perfil de facturación."
+                elif "billing_email_key" in str(e).lower():
+                    error_detail = "El correo electrónico ya está en uso en otro perfil de facturación."
+                elif "billing_rfc_key" in str(e).lower():
+                    error_detail = "El RFC ya está en uso en otro perfil de facturación."
+                else:
+                    error_detail = "Violación de restricción única (ej. email o RFC duplicado)."
+            # '23514' es 'check_violation' (para la regla de user_id O customer_id)
+            elif sqlstate == '23514':
+                 error_detail = f"Falló la regla de negocio (CheckConstraint). Detalle: {e.orig.message}"
+            else:
+                error_detail = f"Error de SQLSTATE {sqlstate}. Detalle: {e.orig.message}"
+        else:
+             error_detail = str(e)
+        
+        logger.warning(f"Error de integridad al crear perfil de facturación para {current_user.email}: {error_detail}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=error_detail)
+    
+    except Exception as e:
         await db.rollback()
-        logger.error(f"Error inesperado al crear billing para customer_id {billing_in.customer_id}: {e}", exc_info=True) # <-- LOGGING AÑADIDO
-        raise HTTPException(status_code=500, detail="Error interno al crear facturación.")
+        logger.error(f"Error inesperado al crear perfil de facturación para {current_user.email}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error interno al crear el perfil.")
 
-@router_billing.get("/customer/{customer_id}", response_model=schemas.BillingRead)
-async def get_billing_by_customer(
-    customer_id: int,
-    current_user: CurrentUser, # <-- Argumento sin default PRIMERO
+@router_billing.get("/user", response_model=schemas.BillingRead)
+async def get_user_billing_profile(
+    current_user: CurrentUser, # Dependencia de usuario autenticado
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Obtiene el perfil de facturación de un cliente.
-    (Necesita autorización).
+    (Fase 1) Obtiene el perfil de facturación del USUARIO (dueño) autenticado.
     """
-    logger.info(f"Usuario {current_user.email} solicitando perfil de facturación para customer_id: {customer_id}") # <-- LOGGING AÑADIDO
-    # TODO: Añadir lógica de autorización
-    result = await db.execute(select(models.Billing).where(models.Billing.customer_id == customer_id))
-    billing = result.scalars().first()
-    if not billing:
-        logger.warning(f"Perfil de facturación no encontrado para customer_id: {customer_id}") # <-- LOGGING AÑADIDO
-        raise HTTPException(status_code=404, detail="Billing profile not found for this customer.")
-    logger.info(f"Perfil de facturación (ID: {billing.id}) encontrado para customer_id: {customer_id}") # <-- LOGGING AÑADIDO
-    return billing
+    logger.info(f"Usuario {current_user.email} (ID: {current_user.id}) solicitando su perfil de facturación.")
 
-@router_billing.patch("/{billing_id}", response_model=schemas.BillingRead)
-async def patch_billing_profile(
-    billing_id: int,
-    billing_in: schemas.BillingUpdate,
-    current_user: CurrentUser, # <-- Argumento sin default PRIMERO
+    # 1. Buscar el perfil de facturación vinculado a este usuario
+    # (Asumiendo que has añadido la FK 'user_id' a la tabla 'Billing' como propusimos)
+    result = await db.execute(
+        select(models.Billing).where(models.Billing.user_id == current_user.id)
+    )
+    billing_profile = result.scalars().first()
+
+    # 2. Manejar el caso de que no se encuentre
+    if not billing_profile:
+        logger.warning(f"No se encontró perfil de facturación para el usuario {current_user.email}.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Perfil de facturación no encontrado para este usuario."
+        )
+
+    # 3. Devolver el perfil si se encuentra
+    logger.info(f"Perfil de facturación (ID: {billing_profile.id}) encontrado para el usuario {current_user.email}.")
+    return billing_profile
+
+@router_billing.patch("/user", response_model=schemas.BillingRead)
+async def patch_user_billing_profile(
+    billing_in: schemas.BillingUpdate, # El esquema PATCH que permite campos opcionales
+    current_user: CurrentUser,
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Actualiza parcialmente un perfil de facturación.
-    (Necesita autorización).
+    (Fase 1) Actualiza parcialmente el perfil de facturación del USUARIO (dueño) autenticado.
     """
-    logger.info(f"Usuario {current_user.email} intentando actualizar perfil de facturación ID: {billing_id}") # <-- LOGGING AÑADIDO
-    billing = await db.get(models.Billing, billing_id)
-    if not billing:
-        logger.warning(f"Actualización de billing fallida: ID {billing_id} no encontrado.") # <-- LOGGING AÑADIDO
-        raise HTTPException(status_code=404, detail="Billing profile not found.")
-    # TODO: Añadir lógica de autorización
+    logger.info(f"Usuario {current_user.email} (ID: {current_user.id}) intentando actualizar su perfil de facturación.")
 
+    # 1. Buscar el perfil de facturación existente vinculado a este usuario
+    result = await db.execute(
+        select(models.Billing).where(models.Billing.user_id == current_user.id)
+    )
+    billing_profile = result.scalars().first()
+
+    # 2. Manejar el caso de que no se encuentre
+    if not billing_profile:
+        logger.warning(f"Actualización fallida: No se encontró perfil de facturación para el usuario {current_user.email}.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Perfil de facturación no encontrado para este usuario."
+        )
+
+    # 3. Obtener los datos a actualizar, excluyendo los que no se enviaron (lógica de PATCH)
     update_data = billing_in.model_dump(exclude_unset=True)
-    if not update_data:
-        logger.info(f"Actualización de billing {billing_id} solicitada sin datos.") # <-- LOGGING AÑADIDO
-        raise HTTPException(status_code=400, detail="No data provided for update.")
 
-    logger.debug(f"Datos de actualización para billing {billing_id}: {list(update_data.keys())}") # <-- LOGGING AÑADIDO (solo claves)
+    # 4. Validar si se envió algún dato
+    if not update_data:
+        logger.info(f"Actualización de perfil de facturación solicitada por {current_user.email} sin datos.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No se proporcionaron datos para actualizar."
+        )
+
+    # 5. Aplicar las actualizaciones al objeto del modelo
+    logger.debug(f"Datos de actualización para perfil {billing_profile.id}: {list(update_data.keys())}")
     for key, value in update_data.items():
-        setattr(billing, key, value)
-    db.add(billing)
+        setattr(billing_profile, key, value)
+    
+    db.add(billing_profile) # Marcar el objeto como "sucio" (modificado)
+
+    # 6. Intentar guardar los cambios en la BD (con manejo de errores de integridad)
     try:
         await db.commit()
-        await db.refresh(billing)
-        logger.info(f"Perfil de facturación ID: {billing_id} actualizado exitosamente.") # <-- LOGGING AÑADIDO
-        return billing
-    except IntegrityError as e: # <-- Error específico
-         await db.rollback()
-         logger.warning(f"Error de integridad al actualizar billing {billing_id}: {e}", exc_info=True) # <-- LOGGING AÑADIDO
-         raise HTTPException(status_code=409, detail="Conflicto al actualizar (email o RFC duplicado).")
-    except Exception as e: # <-- Error genérico
+        await db.refresh(billing_profile)
+        logger.info(f"Perfil de facturación (ID: {billing_profile.id}) actualizado exitosamente para el usuario {current_user.email}.")
+        return billing_profile
+
+    except IntegrityError as e:
         await db.rollback()
-        logger.error(f"Error inesperado al actualizar billing {billing_id}: {e}", exc_info=True) # <-- LOGGING AÑADIDO
-        raise HTTPException(status_code=500, detail="Error interno al actualizar facturación.")
+        
+        # Lógica de logging de errores adaptada
+        error_detail = "Error de integridad desconocido."
+        
+        if e.orig and hasattr(e.orig, 'sqlstate'):
+            sqlstate = e.orig.sqlstate
+            # '23505' es 'unique_violation'
+            if sqlstate == '23505':
+                if "billing_email_key" in str(e).lower():
+                    error_detail = "El correo electrónico ya está en uso en otro perfil de facturación."
+                elif "billing_rfc_key" in str(e).lower():
+                    error_detail = "El RFC ya está en uso en otro perfil de facturación."
+                else:
+                    error_detail = "Violación de restricción única (ej. email o RFC duplicado)."
+            else:
+                error_detail = f"Error de SQLSTATE {sqlstate}. Detalle: {e.orig.message}"
+        else:
+             error_detail = str(e)
+        
+        logger.warning(f"Error de integridad al actualizar perfil de facturación para {current_user.email}: {error_detail}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=error_detail)
+    
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error inesperado al actualizar perfil de facturación para {current_user.email}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error interno al actualizar el perfil.")
+
+
+
+#@router_billing.get("/customer/{customer_id}", response_model=schemas.BillingRead)
+#async def get_billing_by_customer(
+    #customer_id: int,
+    #current_user: CurrentUser, # <-- Argumento sin default PRIMERO
+    #db: AsyncSession = Depends(get_db)
+#):
+    #"""
+    #Obtiene el perfil de facturación de un cliente.
+    #(Necesita autorización).
+    #"""
+    #logger.info(f"Usuario {current_user.email} solicitando perfil de facturación para customer_id: {customer_id}") # <-- LOGGING AÑADIDO
+    # TODO: Añadir lógica de autorización
+    #result = await db.execute(select(models.Billing).where(models.Billing.customer_id == customer_id))
+    #billing = result.scalars().first()
+    #if not billing:
+        #logger.warning(f"Perfil de facturación no encontrado para customer_id: {customer_id}") # <-- LOGGING AÑADIDO
+        #raise HTTPException(status_code=404, detail="Billing profile not found for this customer.")
+    #logger.info(f"Perfil de facturación (ID: {billing.id}) encontrado para customer_id: {customer_id}") # <-- LOGGING AÑADIDO
+    #return billing
+
 
 
 # --- Endpoints para Pagos (Payments) ---
-@router_payments.post("/", response_model=schemas.PaymentRead, status_code=status.HTTP_201_CREATED)
-async def create_payment_record(
-    payment_in: schemas.PaymentCreate,
-    current_user: CurrentUser, # <-- Argumento sin default PRIMERO
+#@router_payments.post("/", response_model=schemas.PaymentRead, status_code=status.HTTP_201_CREATED)
+#async def create_payment_record(
+    #payment_in: schemas.PaymentCreate,
+    #current_user: CurrentUser, # <-- Argumento sin default PRIMERO
+    #db: AsyncSession = Depends(get_db)
+#):
+    #"""
+    #Crea un registro de pago. (Usualmente llamado internamente o por webhook de pasarela).
+    #"""
+    #logger.info(f"Intento de crear registro de pago para order_id: {payment_in.order_id} por {current_user.email}") # <-- LOGGING AÑADIDO
+    # Validaciones de IDs y consistencia
+    #order = await db.get(models.Order, payment_in.order_id)
+    #customer = await db.get(models.Customer, payment_in.customer_id)
+    #billing = await db.get(models.Billing, payment_in.billing_id)
+    #if not order or not customer or not billing:
+         #logger.warning(f"Creación de pago fallida: Orden ({payment_in.order_id}), Cliente ({payment_in.customer_id}), o Billing ({payment_in.billing_id}) no encontrados.") # <-- LOGGING AÑADIDO
+         #raise HTTPException(status_code=404, detail="Referenced Order, Customer, or Billing not found.")
+    #if billing.customer_id != payment_in.customer_id or order.customer_id != payment_in.customer_id:
+         #logger.warning(f"Creación de pago fallida: Inconsistencia de IDs para order_id {payment_in.order_id}") # <-- LOGGING AÑADIDO
+         #raise HTTPException(status_code=400, detail="ID mismatch.")
+    # TODO: Añadir autorización robusta
+
+    #new_payment = models.Payment(**payment_in.model_dump())
+    #db.add(new_payment)
+    #try:
+        #await db.commit()
+        #await db.refresh(new_payment)
+        #logger.info(f"Registro de pago creado (ID: {new_payment.id}) para order_id: {payment_in.order_id}") # <-- LOGGING AÑADIDO
+        #return new_payment
+    #except Exception as e: # <-- Error genérico
+        #await db.rollback()
+        #logger.error(f"Error inesperado al crear pago para order_id {payment_in.order_id}: {e}", exc_info=True) # <-- LOGGING AÑADIDO
+        #raise HTTPException(status_code=500, detail="Error interno al crear pago.")
+
+#@router_payments.get("/order/{order_id}", response_model=List[schemas.PaymentRead])
+#async def get_payments_for_order(
+    #order_id: int,
+    #current_user: CurrentUser, # <-- Argumento sin default PRIMERO
+    #skip: int = 0, # <-- Argumento con default DESPUÉS
+    #limit: int = 20, # <-- Argumento con default DESPUÉS
+    #db: AsyncSession = Depends(get_db)
+#):
+    #"""
+    #Obtiene los registros de pago para una orden específica.
+    #(Necesita autorización).
+    #"""
+    #logger.info(f"Usuario {current_user.email} solicitando pagos para order_id: {order_id}") # <-- LOGGING AÑADIDO
+    # Verificar si la orden existe y si el usuario tiene permiso para verla
+    #order = await db.get(models.Order, order_id)
+    #if not order:
+        #logger.warning(f"Búsqueda de pagos fallida: Orden {order_id} no encontrada.") # <-- LOGGING AÑADIDO
+        #raise HTTPException(status_code=404, detail="Order not found.")
+    #TODO: Lógica de autorización (¿Usuario es dueño del negocio asociado a la orden? ¿Es el cliente dueño de la orden?)
+
+    #result = await db.execute(
+        #select(models.Payment).where(models.Payment.order_id == order_id).offset(skip).limit(limit)
+    #)
+    #payments = result.scalars().all()
+    #logger.info(f"Encontrados {len(payments)} pagos para order_id: {order_id}") # <-- LOGGING AÑADIDO
+    #return payments
+
+
+@router_payments.post("/subscription", response_model=schemas.PaymentRead, status_code=status.HTTP_201_CREATED)
+async def create_subscription_payment(
+    payment_in: schemas.SubscriptionPaymentCreate, # <<<--- ASEGÚRATE DE QUE DICE ESTO
+    current_user: CurrentUser,
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Crea un registro de pago. (Usualmente llamado internamente o por webhook de pasarela).
+    (Fase 1) Crea un registro de pago para una SUSCRIPCIÓN del USUARIO autenticado.
     """
-    logger.info(f"Intento de crear registro de pago para order_id: {payment_in.order_id} por {current_user.email}") # <-- LOGGING AÑADIDO
-    # Validaciones de IDs y consistencia
-    order = await db.get(models.Order, payment_in.order_id)
-    customer = await db.get(models.Customer, payment_in.customer_id)
-    billing = await db.get(models.Billing, payment_in.billing_id)
-    if not order or not customer or not billing:
-         logger.warning(f"Creación de pago fallida: Orden ({payment_in.order_id}), Cliente ({payment_in.customer_id}), o Billing ({payment_in.billing_id}) no encontrados.") # <-- LOGGING AÑADIDO
-         raise HTTPException(status_code=404, detail="Referenced Order, Customer, or Billing not found.")
-    if billing.customer_id != payment_in.customer_id or order.customer_id != payment_in.customer_id:
-         logger.warning(f"Creación de pago fallida: Inconsistencia de IDs para order_id {payment_in.order_id}") # <-- LOGGING AÑADIDO
-         raise HTTPException(status_code=400, detail="ID mismatch.")
-    # TODO: Añadir autorización robusta
+    logger.info(f"Usuario {current_user.email} (ID: {current_user.id}) iniciando pago de suscripción.")
 
-    new_payment = models.Payment(**payment_in.model_dump())
+    # 1. Validar el Perfil de Facturación (Validación de Seguridad Crítica)
+    # Buscamos el perfil de facturación que el usuario quiere usar.
+    billing_profile = await db.get(models.Billing, payment_in.billing_id)
+
+    # 1a. Verificar que el perfil de facturación existe
+    if not billing_profile:
+        logger.warning(f"Pago fallido para {current_user.email}: Perfil de facturación ID {payment_in.billing_id} no encontrado.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Perfil de facturación no encontrado."
+        )
+
+    # 1b. ¡VERIFICAR QUE EL PERFIL PERTENECE AL USUARIO!
+    # Esto evita que un usuario pague usando el perfil de otro.
+    if billing_profile.user_id != current_user.id:
+        logger.error(
+            f"FALLO DE SEGURIDAD: Usuario {current_user.email} (ID: {current_user.id}) "
+            f"intentó usar el perfil de facturación {billing_profile.id}, "
+            f"que pertenece al usuario ID {billing_profile.user_id}."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, # 403 Prohibido
+            detail="El perfil de facturación no pertenece a este usuario."
+        )
+
+    # 2. Crear el nuevo objeto de pago
+    new_payment = models.Payment(
+        user_id=current_user.id,            # Vinculado al User
+        billing_id=billing_profile.id,      # Usamos el ID del perfil validado
+        total_amount=payment_in.total_amount,
+        tax_amount=payment_in.tax_amount,   
+        discount=payment_in.discount,       
+        currency=payment_in.currency,       
+        status=payment_in.status,           
+        payment_method=payment_in.payment_method,
+        payment_description=payment_in.payment_description
+    )
     db.add(new_payment)
+
+    # 3. Intentar guardar en la BD (con manejo de errores robusto)
     try:
         await db.commit()
         await db.refresh(new_payment)
-        logger.info(f"Registro de pago creado (ID: {new_payment.id}) para order_id: {payment_in.order_id}") # <-- LOGGING AÑADIDO
+        logger.info(f"Pago de suscripción (ID: {new_payment.id}) creado exitosamente para el usuario {current_user.email}.")
         return new_payment
-    except Exception as e: # <-- Error genérico
-        await db.rollback()
-        logger.error(f"Error inesperado al crear pago para order_id {payment_in.order_id}: {e}", exc_info=True) # <-- LOGGING AÑADIDO
-        raise HTTPException(status_code=500, detail="Error interno al crear pago.")
 
-@router_payments.get("/order/{order_id}", response_model=List[schemas.PaymentRead])
-async def get_payments_for_order(
-    order_id: int,
-    current_user: CurrentUser, # <-- Argumento sin default PRIMERO
-    skip: int = 0, # <-- Argumento con default DESPUÉS
-    limit: int = 20, # <-- Argumento con default DESPUÉS
+    except IntegrityError as e:
+        await db.rollback()
+        
+        # Lógica de logging de errores adaptada para Pagos
+        error_detail = "Error de integridad desconocido."
+        
+        if e.orig and hasattr(e.orig, 'sqlstate'):
+            sqlstate = e.orig.sqlstate
+            # '23514' es 'check_violation'
+            if sqlstate == '23514':
+                if "_payment_type_check" in str(e).lower():
+                    error_detail = "Falló la regla de negocio (CheckConstraint). El pago debe ser de tipo Suscripción (user_id) o Pedido (customer_id/order_id)."
+                else:
+                    error_detail = f"Falló una regla de negocio (CheckConstraint). Detalle: {e.orig.message}"
+            # '23503' es 'foreign_key_violation'
+            elif sqlstate == '23503':
+                 error_detail = f"Violación de llave foránea (ej. el billing_id no existe). Detalle: {e.orig.message}"
+            else:
+                error_detail = f"Error de SQLSTATE {sqlstate}. Detalle: {e.orig.message}"
+        else:
+             error_detail = str(e)
+
+        logger.warning(f"Error de integridad al crear pago de suscripción para {current_user.email}: {error_detail}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=error_detail)
+
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error inesperado al crear pago de suscripción para {current_user.email}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error interno al crear el pago.")
+
+
+
+@router_payments.get("/user", response_model=List[schemas.PaymentRead])
+async def get_user_payments(
+    current_user: CurrentUser,
+    skip: int = 0, # Parámetro de paginación
+    limit: int = 20, # Límite de resultados por página
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Obtiene los registros de pago para una orden específica.
-    (Necesita autorización).
+    (Fase 1) Obtiene el historial de pagos (suscripciones) del USUARIO autenticado,
+    con paginación.
     """
-    logger.info(f"Usuario {current_user.email} solicitando pagos para order_id: {order_id}") # <-- LOGGING AÑADIDO
-    # Verificar si la orden existe y si el usuario tiene permiso para verla
-    order = await db.get(models.Order, order_id)
-    if not order:
-        logger.warning(f"Búsqueda de pagos fallida: Orden {order_id} no encontrada.") # <-- LOGGING AÑADIDO
-        raise HTTPException(status_code=404, detail="Order not found.")
-    # TODO: Lógica de autorización (¿Usuario es dueño del negocio asociado a la orden? ¿Es el cliente dueño de la orden?)
+    logger.info(f"Usuario {current_user.email} (ID: {current_user.id}) solicitando su historial de pagos (skip={skip}, limit={limit}).")
 
-    result = await db.execute(
-        select(models.Payment).where(models.Payment.order_id == order_id).offset(skip).limit(limit)
+    # 1. Construir la consulta para los pagos del usuario
+    query = (
+        select(models.Payment)
+        .where(models.Payment.user_id == current_user.id)
+        .order_by(models.Payment.created_at.desc()) # Ordenar por más reciente
+        .offset(skip)
+        .limit(limit)
     )
-    payments = result.scalars().all()
-    logger.info(f"Encontrados {len(payments)} pagos para order_id: {order_id}") # <-- LOGGING AÑADIDO
-    return payments
+
+    # 2. Ejecutar la consulta
+    try:
+        result = await db.execute(query)
+        payments = result.scalars().all()
+        
+        logger.info(f"Encontrados {len(payments)} registros de pago para el usuario {current_user.email}.")
+        
+        # 3. Devolver la lista de pagos
+        # Si no se encuentran pagos, esto devolverá una lista vacía "[]",
+        # lo cual es correcto y esperado.
+        return payments
+
+    except Exception as e:
+        # Manejo de error genérico en caso de fallo de la consulta
+        logger.error(f"Error inesperado al obtener el historial de pagos para {current_user.email}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error interno al obtener el historial de pagos."
+        )
+
+
+
 
 @router_payments.patch("/{payment_id}", response_model=schemas.PaymentRead)
 async def patch_payment_record(

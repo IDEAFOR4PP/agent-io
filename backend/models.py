@@ -1,5 +1,5 @@
 from sqlalchemy import (Column, Integer, String, Float, ForeignKey, 
-                        create_engine, DateTime, UniqueConstraint, TEXT)
+                        create_engine, DateTime, UniqueConstraint, TEXT, CheckConstraint)
 from sqlalchemy.orm import relationship, declarative_base
 from sqlalchemy.sql import func
 
@@ -13,6 +13,8 @@ class Customer(Base):
     address = Column(String)
     
     orders = relationship("Order", back_populates="customer")
+    billing_profile = relationship("Billing", back_populates="customer", uselist=False)
+    payments = relationship("Payment", back_populates="customer")
     billing_profile = relationship("Billing", back_populates="customer", uselist=False)
     payments = relationship("Payment", back_populates="customer")
     
@@ -96,7 +98,8 @@ class User(Base):
     password = Column(TEXT, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     businesses = relationship("Business", back_populates="owner", foreign_keys="[Business.user_id]")
-    
+    billing_profile = relationship("Billing", back_populates="user", uselist=False)
+    payments = relationship("Payment", back_populates="user")
 
 class Billing(Base):
     """
@@ -104,8 +107,8 @@ class Billing(Base):
     """
     __tablename__ = 'billing'
     id = Column(Integer, primary_key=True)
-    customer_id = Column(Integer, ForeignKey('customers.id'), nullable=False, unique=True)
-    
+    customer_id = Column(Integer, ForeignKey('customers.id'), nullable=True, unique=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=True, unique=True)
     name = Column(String(255), nullable=False)
     email = Column(String(255), nullable=False, unique=True)
     business_address = Column(String)
@@ -117,7 +120,18 @@ class Billing(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     customer = relationship("Customer", back_populates="billing_profile")
+    user = relationship("User", back_populates="billing_profile") # <--- AÑADIR RELACIÓN
     payments = relationship("Payment", back_populates="billing_profile")
+
+    __table_args__ = (
+        CheckConstraint(
+            '(customer_id IS NOT NULL AND user_id IS NULL) OR (customer_id IS NULL AND user_id IS NOT NULL)',
+            name='_billing_owner_check'
+        ),
+    )
+    
+
+
 
 class Payment(Base):
     """
@@ -125,8 +139,9 @@ class Payment(Base):
     """
     __tablename__ = 'payments'
     id = Column(Integer, primary_key=True)
-    order_id = Column(Integer, ForeignKey('orders.id'), nullable=False)
-    customer_id = Column(Integer, ForeignKey('customers.id'), nullable=False)
+    order_id = Column(Integer, ForeignKey('orders.id'), nullable=True)
+    customer_id = Column(Integer, ForeignKey('customers.id'), nullable=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=True)
     billing_id = Column(Integer, ForeignKey('billing.id'), nullable=False)
     
     total_amount = Column(Float, nullable=False) # Usamos Float por consistencia con 'price'
@@ -135,6 +150,7 @@ class Payment(Base):
     currency = Column(String(10), nullable=False, default='MXN')
     
     status = Column(String(50), nullable=False, default='pending')
+    payment_description = Column(String(255), nullable=True)
     payment_method = Column(String(100))
     bank_reference = Column(String(255))
     authorization_code = Column(String(255))
@@ -142,7 +158,19 @@ class Payment(Base):
     
     order = relationship("Order", back_populates="payments")
     customer = relationship("Customer", back_populates="payments")
+    user = relationship("User", back_populates="payments") # <--- AÑADIR RELACIÓN
     billing_profile = relationship("Billing", back_populates="payments")
+
+    __table_args__ = (
+        CheckConstraint(
+            # Pago de Pedido (requiere order_id y customer_id)
+            '(order_id IS NOT NULL AND customer_id IS NOT NULL AND user_id IS NULL)'
+            ' OR '
+            # Pago de Suscripción (requiere user_id)
+            '(order_id IS NULL AND customer_id IS NULL AND user_id IS NOT NULL)',
+            name='_payment_type_check'
+        ),
+    )
 
 # =============================================================================
 # --- FIN DE NUEVAS TABLAS ---
